@@ -1,0 +1,51 @@
+{
+  "sequence": {
+    "fps": 24,
+    "tracks": [
+      {
+        "id": "track_video",
+        "type": "video",
+        "clips": [
+          {
+            "instanceId": "video_main",
+            "clipRef": {
+              "mediatype": "video",
+              "mediaid": "/Users/mac/Downloads/Videos/Future Garage].mp4"
+            },
+            "start_ms": 0,
+            "duration_ms": 5000,
+            "layer": 0
+          }
+        ]
+      },
+      {
+        "id": "track_subtitles",
+        "type": "text",
+        "clips": [
+          {
+            "instanceId": "subtitle_block",
+            "clipRef": {
+              "mediatype": "text",
+              "mediaid": "example_subtitle",
+              "text": "lola greysome"
+            },
+            "start_ms": 1000,
+            "end_ms": 4000,
+            "layer": 1,
+            "transforms": [
+              {
+                "property": "opacity",
+                "keyframes": [
+                  { "t": 1000, "value": 0 },
+                  { "t": 1200, "value": 1 },
+                  { "t": 3800, "value": 1 },
+                  { "t": 4000, "value": 0 }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
