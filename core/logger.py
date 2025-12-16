@@ -1,26 +1,38 @@
+import bpy
+
 class Logger:
     _buffer = []
 
     @classmethod
-    def get(cls):
-        """Return Logger class (singleton style)"""
-        return cls
+    def _push_ui(cls, line):
+        scene = bpy.context.scene if bpy.context else None
+        if not scene:
+            return
+
+        props = getattr(scene, "vse_instructor_server_props", None)
+        if not props:
+            return
+
+        item = props.logs.add()
+        item.text = line
+
+        # keep log size sane
+        if len(props.logs) > 200:
+            props.logs.remove(0)
+
+        # also update "Last Message"
+        props.last_message = line
 
     @classmethod
     def info(cls, msg: str):
-        """Log an info message"""
         line = f"[INFO] {msg}"
         cls._buffer.append(line)
-        print(line)  # Prints to Blender console
+        print(line)
+        cls._push_ui(line)
 
     @classmethod
     def error(cls, msg: str):
-        """Log an error message"""
         line = f"[ERROR] {msg}"
         cls._buffer.append(line)
-        print(line)  # Prints to Blender console
-
-    @classmethod
-    def tail(cls, n=50):
-        """Return last n log entries"""
-        return cls._buffer[-n:]
+        print(line)
+        cls._push_ui(line)

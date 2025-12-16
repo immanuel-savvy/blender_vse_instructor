@@ -1,16 +1,25 @@
 import bpy
 from ..core.logger import Logger
 from pathlib import Path
-import os
 import urllib.request
+import json
+import base64
+from pathlib import Path
+from .vse_renderer import Vse_renderer
 
-class VSEBuilder:
+
+CACHE_ROOT = Path.home() / "VSEInstructorCache"
+CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+
+class VSEBuilder(Vse_renderer):
     def __init__(self, instruction):
         """instruction: normalized dict from parse_instruction"""
-        self.log = Logger.get()
+        self.log = Logger()
 
         self.log.info("Initializing VSEBuilder...")
         self.log.info(f"Instruction received: {instruction}")
+
+        self.editor_url = 'https://editor-backend-xi.vercel.app'
 
         self.instruction = instruction
         self.sequencer = bpy.context.scene.sequence_editor
@@ -21,52 +30,124 @@ class VSEBuilder:
         else:
             self.log.info("Sequence editor found and ready.")
 
-    # -------------------------------------------------------------------------
-    # MEDIA RESOLVER
-    # -------------------------------------------------------------------------
+    
+    def _fetch_chunk_from_server(self, media_id, index):
+        payload = json.dumps({
+            "media_id": media_id,
+            "index": index
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            url=f"{self.editor_url}/read_upload",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+
+        with urllib.request.urlopen(req) as res:
+            return json.loads(res.read().decode("utf-8"))
+
+    def _infer_extension(self, clip_ref):
+        mime = clip_ref.get("mime")
+        title = clip_ref.get("title")
+
+        MIME_MAP = {
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "video/mp4": ".mp4",
+            "audio/mpeg": ".mp3",
+            "audio/wav": ".wav",
+        }
+
+        if mime in MIME_MAP:
+            return MIME_MAP[mime]
+
+        if title and "." in title:
+            return Path(title).suffix
+
+        return ".bin"  # absolute fallback
+
+
     def _resolve_media(self, clip_ref):
-        self.log.info(f"Resolving media for clip_ref: {clip_ref}")
+        self.log.info(f"Resolving media: {clip_ref}")
 
-        mediatype = clip_ref.get("mediatype")
-        mediaid = clip_ref.get("mediaid")
+        media_type = clip_ref.get("type")
+        media_id = clip_ref.get("_id")
 
-        if mediatype in ["video", "audio"]:
-            self.log.info(f"Media type is {mediatype}, id = {mediaid}")
-
-            path = Path(mediaid)
-            if path.exists():
-                self.log.info(f"Local file exists: {path}")
-                return str(path)
-
-            elif mediaid.startswith("http"):
-                tmp_dir = Path(bpy.app.tempdir)
-                filename = Path(mediaid).name
-                local_path = tmp_dir / filename
-
-                self.log.info(f"Media is remote. Will download to: {local_path}")
-
-                if not local_path.exists():
-                    self.log.info(f"Downloading {mediaid} ...")
-                    urllib.request.urlretrieve(mediaid, local_path)
-                    self.log.info("Download complete.")
-
-                return str(local_path)
-
-            else:
-                self.log.error(f"Media not found at path or url: {mediaid}")
-                return None
-
-        elif mediatype == "text":
-            self.log.info(f"Media is TEXT, content: {clip_ref.get('text')}")
+        if media_type == "text":
             return clip_ref.get("text", "Text strip")
-
-        else:
-            self.log.error(f"Unsupported media type: {mediatype}")
+        
+        if (media_type == 'scene'):
             return None
 
-    # -------------------------------------------------------------------------
-    # CUT & DURATION HANDLING
-    # -------------------------------------------------------------------------
+        if media_type not in {"video", "audio", "image"}:
+            self.log.error(f"Unsupported media type: {media_type}")
+            return None
+
+        media_dir = CACHE_ROOT / media_id.replace(":", "_")
+        chunks_dir = media_dir / "chunks"
+        ext = self._infer_extension(clip_ref)
+        final_path = media_dir / f"final{ext}"
+
+        media_dir.mkdir(parents=True, exist_ok=True)
+        chunks_dir.mkdir(parents=True, exist_ok=True)
+
+        # ----------------------------
+        # CACHE HIT
+        # ----------------------------
+        if final_path.exists():
+            self.log.info(f"Using cached media: {final_path}")
+            return str(final_path)
+
+        self.log.info("Media not cached. Fetching from server...")
+
+        # ----------------------------
+        # DOWNLOAD CHUNKS
+        # ----------------------------
+        index = 0
+        total_chunks = None
+
+        while True:
+            part_path = chunks_dir / f"{index:05d}.part"
+
+            if part_path.exists():
+                self.log.info(f"Chunk {index} already cached")
+                index += 1
+                continue
+
+            response = self._fetch_chunk_from_server(media_id, index)
+
+            if not response.get("ok"):
+                self.log.error(f"Failed to fetch chunk {index}")
+                return None
+
+            data = response["data"]
+            base64_chunk = data["chunk"]
+            total_chunks = data["total_chunks"]
+
+            binary = base64.b64decode(base64_chunk)
+            part_path.write_bytes(binary)
+
+            self.log.info(f"Downloaded chunk {index+1}/{total_chunks}")
+
+            index += 1
+            if index >= total_chunks:
+                break
+
+        # ----------------------------
+        # ASSEMBLE FINAL BINARY (ONCE)
+        # ----------------------------
+        self.log.info("Assembling final binary...")
+
+        with open(final_path, "wb") as outfile:
+            for part in sorted(chunks_dir.iterdir()):
+                outfile.write(part.read_bytes())
+
+        self.log.info(f"Media assembled: {final_path}")
+
+        return str(final_path)
+
+ 
     def _apply_cut_and_duration(self, strip, cut, duration_ms, fps):
         self.log.info(f"Applying cut/duration to strip {strip.name}")
         self.log.info(f"Initial strip frame_duration: {strip.frame_duration}")
@@ -94,6 +175,7 @@ class VSEBuilder:
             self.log.info(f"Applied strip.frame_final_duration = {strip.frame_final_duration}")
             
 
+
     # -------------------------------------------------------------------------
     def _ms_to_frames(self, ms, fps=24):
         frames = int((ms / 1000.0) * fps)
@@ -108,8 +190,8 @@ class VSEBuilder:
             self.log.info(f"Adding VIDEO clip: {clip}")
 
             fps = sequence_payload.get('fps')
-            clip_ref = clip.get('clipRef')
-            filepath = clip_ref.get('mediaid')
+            clip_ref = clip.get('clip_ref')
+            filepath = self._resolve_media(clip_ref)
             cut = clip_ref.get('cut')
             name = clip.get('instanceId')
 
@@ -168,8 +250,8 @@ class VSEBuilder:
             fps = payload.get("fps")
 
             name = clip.get("instanceId")
-            clip_ref = clip.get("clipRef")
-            filepath = clip_ref.get("mediaid")
+            clip_ref = clip.get("clip_ref")
+            filepath = self._resolve_media(clip_ref)
 
             start_frame = self._ms_to_frames(clip.get('start_ms', 0), fps)
             layer = clip.get('layer', 1)
@@ -203,7 +285,9 @@ class VSEBuilder:
             end_frame = self._ms_to_frames(start_ms + duration_ms)
             layer = clip.get('layer', 1)
 
-            text = clip.get("clipRef", {}).get("text")
+            clip_ref = clip.get("clip_ref", {})
+            
+            text = clip_ref.get("text")
 
             self.log.info(f"TEXT '{text}' from {start_frame} → {end_frame}")
 
@@ -225,12 +309,48 @@ class VSEBuilder:
             return None
 
     # -------------------------------------------------------------------------
+# IMAGE STRIP
+# -------------------------------------------------------------------------
+    def _add_image_clip(self, clip, sequence_payload):
+        try:
+            self.log.info(f"Adding IMAGE clip: {clip}")
+
+            fps = sequence_payload.get("fps", 24)
+            clip_ref = clip.get("clip_ref")
+            filepath = self._resolve_media(clip_ref)
+            if not filepath:
+                self.log.error("Failed to resolve image media.")
+                return None
+
+            name = clip.get("instanceId")
+            start_ms = clip.get("start_ms", 0)
+            duration_ms = clip.get("duration_ms", 5000)  # default 5s
+            start_frame = self._ms_to_frames(start_ms, fps)
+            duration_frames = self._ms_to_frames(duration_ms, fps)
+            layer = clip.get("layer", 1)
+
+            image_strip = self.sequencer.sequences.new_image(
+                name=f"{name}_IMG",
+                filepath=filepath,
+                frame_start=start_frame,
+                channel=layer
+            )
+            image_strip.frame_final_duration = duration_frames
+
+            self.log.info(f"Created IMAGE strip: {image_strip.name} from frame {start_frame} to {start_frame+duration_frames}")
+            return image_strip
+
+        except Exception as e:
+            self.log.error(f"Failed to add IMAGE: {e}")
+            return None
+
+    # -------------------------------------------------------------------------
     # MAIN BUILD
     # -------------------------------------------------------------------------
     def build(self):
         self.log.info("===== BEGIN VSE BUILD =====")
 
-        seq = self.instruction.get("sequence", {})
+        seq = self.instruction.get("sequence", self.instruction)
         fps = seq.get("fps", 24)
         tracks = seq.get("tracks", [])
 
@@ -250,7 +370,8 @@ class VSEBuilder:
             for clip_index, clip in enumerate(track.get("clips", [])):
                 self.log.info(f"-- Clip #{clip_index}: {clip}")
 
-                mediatype = clip.get("clipRef", {}).get("mediatype")
+                clip_ref = clip.get("clip_ref", {})
+                mediatype = clip_ref.get("type")
                 self.log.info(f"Mediatype = {mediatype}")
 
                 if mediatype == "video":
@@ -262,7 +383,13 @@ class VSEBuilder:
                 elif mediatype == "text":
                     self._add_text_clip(clip, track_payload)
 
+                elif mediatype == 'image':
+                    self._add_image_clip(clip, track_payload)
+
                 else:
                     self.log.error(f"Unsupported mediatype: {mediatype}")
+
+        
+        self.setup_timeline_from_output(self.instruction.get('output', {}))
 
         self.log.info("===== VSE BUILD COMPLETE =====")

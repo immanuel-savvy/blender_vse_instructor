@@ -31,4 +31,6 @@ class VSE_INSTRUCTOR_PT_MainPanel(Panel):
       layout.operator("vse_instructor.import_instruction", text='Load Instruction')  
 
       layout.operator('vse_instructor.apply_instruction', text='Apply')
+
+      layout.operator('vse_instructor.render_sequence', text='Render')
       

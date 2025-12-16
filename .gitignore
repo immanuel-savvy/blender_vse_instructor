@@ -16,3 +16,9 @@ env/
 # Blender backup files
 *.blend1
 *.blend2
+
+.env
+*.env
+**/*.env
+
+Backend/
