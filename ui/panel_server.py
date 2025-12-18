@@ -3,6 +3,7 @@ from bpy.types import Panel
 from bpy.types import PropertyGroup
 from bpy.props import StringProperty, CollectionProperty
 
+
 class VSEServerLogLine(PropertyGroup):
     text: StringProperty()
 

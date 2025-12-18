@@ -95,3 +95,4 @@ class Vse_renderer:
         bpy.ops.render.render(animation=True, write_still=True)
     else:
         bpy.ops.render.render(write_still=True)
+

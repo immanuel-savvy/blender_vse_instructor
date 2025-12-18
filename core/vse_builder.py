@@ -6,12 +6,19 @@ import json
 import base64
 from pathlib import Path
 from .vse_renderer import Vse_renderer
+from datetime import datetime, timezone
+import os
+import math
+import uuid
+
 
 
 CACHE_ROOT = Path.home() / "VSEInstructorCache"
 CACHE_ROOT.mkdir(parents=True, exist_ok=True)
 
 class VSEBuilder(Vse_renderer):
+    server_url = "https://blender-backend.vercel.app"
+
     def __init__(self, instruction):
         """instruction: normalized dict from parse_instruction"""
         self.log = Logger()
@@ -22,6 +29,7 @@ class VSEBuilder(Vse_renderer):
         self.editor_url = 'https://editor-backend-xi.vercel.app'
 
         self.instruction = instruction
+        self.generation = None
         self.sequencer = bpy.context.scene.sequence_editor
 
         if self.sequencer is None:
@@ -30,6 +38,9 @@ class VSEBuilder(Vse_renderer):
         else:
             self.log.info("Sequence editor found and ready.")
 
+    def set_generation(self, generation):
+        self.log.info(f"setting new generation {generation.get('_id')}")
+        self.generation = generation
     
     def _fetch_chunk_from_server(self, media_id, index):
         payload = json.dumps({
@@ -71,6 +82,7 @@ class VSEBuilder(Vse_renderer):
     def _resolve_media(self, clip_ref):
         self.log.info(f"Resolving media: {clip_ref}")
 
+        if(not self.resolving_media): self.update_server_status('RESOLVING_MEDIA')
         media_type = clip_ref.get("type")
         media_id = clip_ref.get("_id")
 
@@ -174,15 +186,13 @@ class VSEBuilder(Vse_renderer):
             self.log.info(f"Duration override: {duration_ms}ms = {duration_frames} frames")
             self.log.info(f"Applied strip.frame_final_duration = {strip.frame_final_duration}")
             
-
-
-    # -------------------------------------------------------------------------
+    #-------------------------------------------------------------------
     def _ms_to_frames(self, ms, fps=24):
         frames = int((ms / 1000.0) * fps)
         self.log.info(f"Converting ms → frames: {ms}ms @ {fps}fps = {frames}")
         return frames
 
-    # -------------------------------------------------------------------------
+    #-----------------------------------------------------------------------
     # VIDEO + AUDIO PAIR
     # -------------------------------------------------------------------------
     def _add_video_clip(self, clip, sequence_payload):
@@ -308,9 +318,8 @@ class VSEBuilder(Vse_renderer):
             self.log.error(f"Failed to add TEXT: {e}")
             return None
 
-    # -------------------------------------------------------------------------
-# IMAGE STRIP
-# -------------------------------------------------------------------------
+    # -----------------------------------------------------
+
     def _add_image_clip(self, clip, sequence_payload):
         try:
             self.log.info(f"Adding IMAGE clip: {clip}")
@@ -361,6 +370,7 @@ class VSEBuilder(Vse_renderer):
             self.log.error("No tracks found. Nothing to build.")
             return
 
+        self.resolving_media = True
         for track_index, track in enumerate(tracks):
             self.log.info(f"=== Processing Track #{track_index} ===")
             self.log.info(f"Track data: {track}")
@@ -389,7 +399,108 @@ class VSEBuilder(Vse_renderer):
                 else:
                     self.log.error(f"Unsupported mediatype: {mediatype}")
 
-        
+        self.resolving_media = False
         self.setup_timeline_from_output(self.instruction.get('output', {}))
 
         self.log.info("===== VSE BUILD COMPLETE =====")
+
+
+    def iso_now():
+        return (
+            datetime.now(timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
+    
+    def _post_json(self, url, payload):
+        self.log.info(f"Sending request {url} with payload::{payload}")
+        req = urllib.request.Request(
+            url=url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        with urllib.request.urlopen(req, timeout=30) as res:
+            return json.loads(res.read().decode("utf-8"))
+
+    def update_server_status(self, status):
+        if (self.generation == None):
+            return
+
+        self._post_json(f"{VSEBuilder.server_url}/update_generation_status", {
+            "_id": self.generation.get("_id"),
+            "status": status,
+            "time": self.iso_now()
+        })
+
+    def upload_rendered_media(
+        self,
+        chunk_size=2 * 1024 * 1024  # 2MB
+    ):
+        scene = bpy.context.scene
+        
+        title = self.instruction.get("name", "<unk>")
+        description = self.instruction.get("description", "")
+        user = self.instruction.get("editor", "<unk>")
+        mime = 'video/mp4'
+        media_type = 'video'
+
+        filepath = Path(scene.render.filepath)
+        total_size = filepath.stat().st_size
+        total_chunks = math.ceil(total_size / chunk_size)
+
+        media_id = str(uuid.uuid4())
+
+        with open(filepath, "rb") as f:
+            for index in range(total_chunks):
+                chunk_bytes = f.read(chunk_size)
+                encoded = base64.b64encode(chunk_bytes).decode("utf-8")
+
+                payload = {
+                    "media_id": media_id,
+                    "chunk": encoded,
+                    "index": index,
+                    "size": len(chunk_bytes),
+                    "total_chunks": total_chunks,
+                }
+
+                self._post_json(
+                    f"{self.editor_url}/upload_media",
+                    payload
+                )
+
+        payload = {
+            "_id": media_id,
+            "title": title,
+            "description": description,
+            "user": user,
+            "mime": mime,
+            "type": media_type,
+            "total_size": total_size,
+        }
+
+        response = self._post_json(
+            f"{self.editor_url}/add_media",
+            payload
+        )
+
+        if not response.get("ok"):
+            return self.log.error("Failed to add media metadata")
+
+        media = response["data"]
+
+        return media
+
+
+
+    def generation_complete(self, media_id):
+        payload = {
+            "_id": self.generation.get('_id'),
+            "editor_media": media_id,
+        }
+
+        self._post_json(
+            f"{VSEBuilder.server_url}/generation_complete",
+            payload
+        )
