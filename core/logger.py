@@ -31,6 +31,13 @@ class Logger:
         cls._push_ui(line)
 
     @classmethod
+    def warning(cls, msg: str):
+        line = f"[WARNING] {msg}"
+        cls._buffer.append(line)
+        print(line)
+        cls._push_ui(line)
+
+    @classmethod
     def error(cls, msg: str):
         line = f"[ERROR] {msg}"
         cls._buffer.append(line)

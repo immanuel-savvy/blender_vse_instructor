@@ -12,9 +12,78 @@ import math
 import uuid
 
 
-
 CACHE_ROOT = Path.home() / "VSEInstructorCache"
 CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+
+TRANSFORM_MAP = {
+
+    # ----------------------------
+    # SPATIAL (Transform Effect)
+    # ----------------------------
+    "scale": {
+        "effect": "TRANSFORM",
+        "axes": {
+            "x": "scale_start_x",
+            "y": "scale_start_y",
+            "v": "scale_start_x",  # uniform shortcut
+        }
+    },
+
+    "translate": {
+        "effect": "TRANSFORM",
+        "axes": {
+            "x": "translate_start_x",
+            "y": "translate_start_y",
+        }
+    },
+
+    "rotate": {
+        "effect": "TRANSFORM",
+        "axes": {
+            "v": "rotation_start",
+        }
+    },
+
+    # ----------------------------
+    # VISUAL (native strip)
+    # ----------------------------
+    "opacity": {
+        "effect": "strip",
+        "axes": {
+            "v": "blend_alpha",
+        }
+    },
+
+    "crop": {
+        "effect": "TRANSFORM",
+        "axes": {
+            "left": "crop_left",
+            "right": "crop_right",
+            "top": "crop_top",
+            "bottom": "crop_bottom",
+        },
+    },
+
+
+    # ----------------------------
+    # AUDIO (native audio strip)
+    # ----------------------------
+    "volume": {
+        "effect": "strip",
+        "axes": {
+            "v": "volume",
+        }
+    },
+
+    "pan": {
+        "effect": "strip",
+        "axes": {
+            "v": "pan",
+        }
+    }
+
+}
+
 
 class VSEBuilder(Vse_renderer):
     server_url = "https://blender-backend.vercel.app"
@@ -27,9 +96,11 @@ class VSEBuilder(Vse_renderer):
         self.log.info(f"Instruction received: {instruction}")
 
         self.editor_url = 'https://editor-backend-xi.vercel.app'
+        self.server_url = 'https://blender-backend.vercel.app'
 
         self.instruction = instruction
         self.generation = None
+        self.resolving_media = False
         self.sequencer = bpy.context.scene.sequence_editor
 
         if self.sequencer is None:
@@ -82,7 +153,10 @@ class VSEBuilder(Vse_renderer):
     def _resolve_media(self, clip_ref):
         self.log.info(f"Resolving media: {clip_ref}")
 
-        if(not self.resolving_media): self.update_server_status('RESOLVING_MEDIA')
+        if(not self.resolving_media): 
+            self.resolving_media = True
+            self.update_server_status('RESOLVING_MEDIA')
+            
         media_type = clip_ref.get("type")
         media_id = clip_ref.get("_id")
 
@@ -160,31 +234,77 @@ class VSEBuilder(Vse_renderer):
         return str(final_path)
 
  
-    def _apply_cut_and_duration(self, strip, cut, duration_ms, fps):
-        self.log.info(f"Applying cut/duration to strip {strip.name}")
-        self.log.info(f"Initial strip frame_duration: {strip.frame_duration}")
+    
+    def _apply_cut_and_duration(self, strip, clip, fps):
+        """
+        Applies source trimming and playback duration
+        WITHOUT affecting timeline placement.
+        """
+
+        duration_ms = clip.get("duration_ms", None)
+        cut = clip.get("cut")
+
+        # ----------------------------
+        # SOURCE IN / OUT (milliseconds)
+        # ----------------------------
+        source_start_ms = 0
+        source_end_ms = None
 
         if cut:
-            self.log.info(f"Cut data: {cut}")
+            source_start_ms = int(cut.get("start_ms", 0))
+            source_end_ms = cut.get("end_ms")
+            if source_end_ms is not None:
+                source_end_ms = int(source_end_ms)
 
-            cut_start = self._ms_to_frames(cut.get("start", 0), fps)
-            cut_end   = self._ms_to_frames(cut.get("end", 0), fps)
+        # ----------------------------
+        # DETERMINE FINAL DURATION
+        # ----------------------------
+        if source_end_ms is not None:
+            available_ms = max(0, source_end_ms - source_start_ms)
+        else:
+            available_ms = None  # unknown until media length
 
-            self.log.info(f"Computed cut_start(frames): {cut_start}")
-            self.log.info(f"Computed cut_end(frames): {cut_end}")
+        if duration_ms is not None:
+            duration_ms = int(duration_ms)
+            final_duration_ms = (
+                min(duration_ms, available_ms)
+                if available_ms is not None
+                else duration_ms
+            )
+        else:
+            final_duration_ms = available_ms
 
-            strip.frame_offset_start = cut_start
-            strip.frame_offset_end   = max(0, strip.frame_duration - cut_end)
+        # ----------------------------
+        # CONVERT TO FRAMES
+        # ----------------------------
+        source_start_frame = self._ms_to_frames(source_start_ms, fps)
 
-            self.log.info(f"Applied strip.frame_offset_start = {strip.frame_offset_start}")
-            self.log.info(f"Applied strip.frame_offset_end   = {strip.frame_offset_end}")
+        if final_duration_ms is not None:
+            final_duration_frames = max(
+                1,
+                self._ms_to_frames(final_duration_ms, fps)
+            )
+        else:
+            # play remaining media
+            final_duration_frames = strip.frame_duration - source_start_frame
 
-        if duration_ms:
-            duration_frames = self._ms_to_frames(duration_ms, fps)
-            strip.frame_final_duration = duration_frames
+        # ----------------------------
+        # APPLY TO STRIP (CRITICAL)
+        # ----------------------------
+        # Apply trim
+        strip.frame_offset_start = source_start_frame
 
-            self.log.info(f"Duration override: {duration_ms}ms = {duration_frames} frames")
-            self.log.info(f"Applied strip.frame_final_duration = {strip.frame_final_duration}")
+        # Counter Blender's implicit forward shift
+        strip.frame_start -= source_start_frame
+
+        strip.frame_final_duration = final_duration_frames
+
+        self.log.info(
+            f"[TRIM] {strip.name} | "
+            f"source_in={source_start_ms}ms, "
+            f"duration={final_duration_ms}ms"
+        )
+
             
     #-------------------------------------------------------------------
     def _ms_to_frames(self, ms, fps=24):
@@ -197,53 +317,45 @@ class VSEBuilder(Vse_renderer):
     # -------------------------------------------------------------------------
     def _add_video_clip(self, clip, sequence_payload):
         try:
-            self.log.info(f"Adding VIDEO clip: {clip}")
-
-            fps = sequence_payload.get('fps')
-            clip_ref = clip.get('clip_ref')
+            fps = sequence_payload.get("fps", 24)
+            clip_ref = clip.get("clip_ref")
             filepath = self._resolve_media(clip_ref)
-            cut = clip_ref.get('cut')
-            name = clip.get('instanceId')
+            name = clip.get("instanceId")
 
-            start_ms = clip.get('start_ms', 0)
+            start_ms = int(clip.get("start_ms", 0))
+            layer = int(clip.get("layer", 1))
+
             start_frame = self._ms_to_frames(start_ms, fps)
-            layer = clip.get('layer', 1)
-            duration_ms = clip.get('duration_ms', 0)
 
-            self.log.info(f"Resolved file path = {filepath}")
-            self.log.info(f"Start frame = {start_frame}, Layer = {layer}, FPS = {fps}")
-            self.log.info(f"Duration override = {duration_ms}ms")
-
-            cut_start_frame = self._ms_to_frames(cut.get('start', 0))
-            calculated_start_frame = start_frame - cut_start_frame
-
-            # Create VIDEO strip
+            # ----------------------------
+            # CREATE VIDEO STRIP
+            # ----------------------------
             video = self.sequencer.sequences.new_movie(
                 name=f"{name}_VID",
                 filepath=filepath,
-                frame_start=calculated_start_frame,
+                frame_start=start_frame,
                 channel=layer
             )
-            self.log.info(f"Created VIDEO strip: {video.name}")
 
-            # Trim logic
-            self._apply_cut_and_duration(video, cut, duration_ms, fps)
+            self._apply_cut_and_duration(video, clip, fps)
 
-            # video.frame_start = start_frame
-            # Create AUDIO strip
+            # ----------------------------
+            # CREATE AUDIO STRIP
+            # ----------------------------
             audio = self.sequencer.sequences.new_sound(
                 name=f"{name}_AUD",
                 filepath=filepath,
-                frame_start=calculated_start_frame,
+                frame_start=start_frame,
                 channel=layer + 1
             )
-            self.log.info(f"Created AUDIO strip: {audio.name}")
+            # audio.use_sound_length = False
 
-            self._apply_cut_and_duration(audio, cut, duration_ms, fps)
-            # audio.frame_start = start_frame
-            # strip.frame_start = start_frame
+            self._apply_cut_and_duration(audio, clip, fps)
 
-            self.log.info(f"Added VIDEO + AUDIO for {filepath} at {start_frame}")
+            self.log.info(
+                f"Added VIDEO+AUD '{name}' @ frame {start_frame}"
+            )
+
             return video, audio
 
         except Exception as e:
@@ -263,8 +375,8 @@ class VSEBuilder(Vse_renderer):
             clip_ref = clip.get("clip_ref")
             filepath = self._resolve_media(clip_ref)
 
-            start_frame = self._ms_to_frames(clip.get('start_ms', 0), fps)
-            layer = clip.get('layer', 1)
+            start_frame = self._ms_to_frames(int(clip.get('start_ms', 0)), fps)
+            layer = int(clip.get('layer', 1))
 
             audio = self.sequencer.sequences.new_sound(
                 name=f"{name}_AUDONLY",
@@ -272,6 +384,8 @@ class VSEBuilder(Vse_renderer):
                 frame_start=start_frame,
                 channel=layer
             )
+
+            self._apply_cut_and_duration(audio, clip, fps)
 
             self.log.info(f"Created AUDIO ONLY strip {audio.name} @ frame {start_frame}")
             return audio
@@ -293,7 +407,7 @@ class VSEBuilder(Vse_renderer):
 
             start_frame = self._ms_to_frames(start_ms)
             end_frame = self._ms_to_frames(start_ms + duration_ms)
-            layer = clip.get('layer', 1)
+            layer = int(clip.get('layer', 1))
 
             clip_ref = clip.get("clip_ref", {})
             
@@ -332,11 +446,11 @@ class VSEBuilder(Vse_renderer):
                 return None
 
             name = clip.get("instanceId")
-            start_ms = clip.get("start_ms", 0)
-            duration_ms = clip.get("duration_ms", 5000)  # default 5s
+            start_ms = int(clip.get("start_ms", 0))
+            duration_ms = int(clip.get("duration_ms", 5000) ) # default 5s
             start_frame = self._ms_to_frames(start_ms, fps)
             duration_frames = self._ms_to_frames(duration_ms, fps)
-            layer = clip.get("layer", 1)
+            layer = int(clip.get("layer", 1))
 
             image_strip = self.sequencer.sequences.new_image(
                 name=f"{name}_IMG",
@@ -353,12 +467,121 @@ class VSEBuilder(Vse_renderer):
             self.log.error(f"Failed to add IMAGE: {e}")
             return None
 
+
+    def _ensure_transform_strip(self, base_strip, finding=False):
+        for s in self.sequencer.sequences:
+            if (
+                s.type == 'TRANSFORM'
+                and s.input_1 == base_strip
+            ):
+                return s
+
+        if finding: return None
+
+        self.log.info(f"Creating TRANSFORM effect for {base_strip.name}")
+
+        return self.sequencer.sequences.new_effect(
+            name=f"{base_strip.name}_XFORM",
+            type='TRANSFORM',
+            frame_start=int(base_strip.frame_start),
+            frame_end=int(base_strip.frame_final_end),
+            channel=base_strip.channel + 1,
+            input1=base_strip
+        )
+
+
+    def _resolve_keyframe_time(self, t, start_frame, duration_frames, fps):
+        if isinstance(t, str) and t.endswith("%"):
+            pct = float(t[:-1]) / 100.0
+            return start_frame + int(duration_frames * pct)
+
+        # assume ms
+        return start_frame + self._ms_to_frames(t, fps)
+
+    def _apply_transforms(self, clip, base_strip):
+        transforms = clip.get("transforms")
+        if not transforms:
+            return
+
+        fps = bpy.context.scene.render.fps
+        start = base_strip.frame_start
+        duration = base_strip.frame_final_duration
+
+        transform_strip = None
+        
+        EFFECT_PRIORITY = {
+            "TRANSFORM": 0,
+            "strip": 1,
+        }
+
+        sorted_transforms = sorted(
+            transforms.items(),
+            key=lambda item: EFFECT_PRIORITY.get(
+                TRANSFORM_MAP.get(item[0], {}).get("effect"),
+                99
+            )
+        )
+        for transform_name, axes in sorted_transforms:
+            spec = TRANSFORM_MAP.get(transform_name)
+
+            if not spec:
+                self.log.warning(f"Unknown transform '{transform_name}', skipping")
+                continue
+
+            # Decide target strip
+            if spec.get("effect") == "TRANSFORM":
+                if transform_strip is None:
+                    transform_strip = self._ensure_transform_strip(base_strip)
+                target = transform_strip
+            else:
+                has_tx = self._ensure_transform_strip(base_strip, finding=True)
+                if has_tx:
+                    target = has_tx
+                else:
+                    target = base_strip
+
+            for axis, keyframes in axes.items():
+                blender_prop = spec["axes"].get(axis)
+
+                if not blender_prop:
+                    self.log.warning(
+                        f"Unsupported axis '{axis}' for transform '{transform_name}'"
+                    )
+                    continue
+
+                if not hasattr(target, blender_prop):
+                    self.log.warning(
+                        f"Strip '{target.name}' has no property '{blender_prop}'"
+                    )
+                    continue
+
+                for kf in keyframes:
+                    frame = self._resolve_keyframe_time(
+                        kf["t"], start, duration, fps
+                    )
+                    value = kf["v"]
+
+                    setattr(target, blender_prop, value)
+                    target.keyframe_insert(
+                        data_path=blender_prop,
+                        frame=frame
+                    )
+
+                    self.log.info(
+                        f"[TRANSFORM] {clip.get('instanceId')} | "
+                        f"{transform_name}.{axis} → "
+                        f"{blender_prop}={value} @ {frame}"
+                    )
+
+
     # -------------------------------------------------------------------------
     # MAIN BUILD
     # -------------------------------------------------------------------------
     def build(self):
         self.log.info("===== BEGIN VSE BUILD =====")
 
+        self._clear_sequencer()
+        
         seq = self.instruction.get("sequence", self.instruction)
         fps = seq.get("fps", 24)
         tracks = seq.get("tracks", [])
@@ -370,7 +593,6 @@ class VSEBuilder(Vse_renderer):
             self.log.error("No tracks found. Nothing to build.")
             return
 
-        self.resolving_media = True
         for track_index, track in enumerate(tracks):
             self.log.info(f"=== Processing Track #{track_index} ===")
             self.log.info(f"Track data: {track}")
@@ -384,28 +606,58 @@ class VSEBuilder(Vse_renderer):
                 mediatype = clip_ref.get("type")
                 self.log.info(f"Mediatype = {mediatype}")
 
+                strip = None
+                video_strip = None
+                audio_strip = None
+
                 if mediatype == "video":
-                    self._add_video_clip(clip, track_payload)
+                    result = self._add_video_clip(clip, track_payload)
+
+                    if result:
+                        video_strip, audio_strip = result
 
                 elif mediatype == "audio":
-                    self._add_audio_clip(clip, track_payload)
+                    audio_strip = self._add_audio_clip(clip, track_payload)
 
                 elif mediatype == "text":
-                    self._add_text_clip(clip, track_payload)
+                    strip = self._add_text_clip(clip, track_payload)
 
-                elif mediatype == 'image':
-                    self._add_image_clip(clip, track_payload)
+                elif mediatype == "image":
+                    strip = self._add_image_clip(clip, track_payload)
 
                 else:
                     self.log.error(f"Unsupported mediatype: {mediatype}")
+
+                # Apply transform strips
+                if video_strip:
+                    self._apply_transforms(clip, video_strip)
+
+                if audio_strip:
+                    self._apply_transforms(clip, audio_strip)
+
+                if strip:
+                    self._apply_transforms(clip, strip)
+
 
         self.resolving_media = False
         self.setup_timeline_from_output(self.instruction.get('output', {}))
 
         self.log.info("===== VSE BUILD COMPLETE =====")
 
+    def _clear_sequencer(self):
+        seq = self.sequencer
 
-    def iso_now():
+        strips = list(seq.sequences_all)
+        if not strips:
+            self.log.info("Sequencer already empty")
+            return
+
+        for strip in strips:
+            seq.sequences.remove(strip)
+
+        self.log.info(f"Cleared {len(strips)} sequencer strips")
+
+    def iso_now(self):
         return (
             datetime.now(timezone.utc)
             .isoformat(timespec="milliseconds")
@@ -413,26 +665,71 @@ class VSEBuilder(Vse_renderer):
         )
     
     def _post_json(self, url, payload):
-        self.log.info(f"Sending request {url} with payload::{payload}")
-        req = urllib.request.Request(
-            url=url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+        self.log.info(f"Preparing to POST to {url} with payload: {payload}")
+        try:
+            self.log.info(f"POST {url}")
+            req = urllib.request.Request(
+                url=url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
 
-        with urllib.request.urlopen(req, timeout=30) as res:
-            return json.loads(res.read().decode("utf-8"))
+            with urllib.request.urlopen(req, timeout=30) as res:
+                return json.loads(res.read().decode("utf-8"))
+
+        except Exception as e:
+            self.log.error(f"POST FAILED {url}: {e}")
+            return {"ok": False, "error": str(e)}
 
     def update_server_status(self, status):
-        if (self.generation == None):
+        if not self.generation:
+            self.log.warning(f"update_server_status skipped ({status}): no generation")
             return
 
-        self._post_json(f"{VSEBuilder.server_url}/update_generation_status", {
+        if not hasattr(self, "machine_id"):
+            self.log.warning("machine_id missing, defaulting")
+            self.machine_id = "unknown"
+
+        self.log.info(
+            f"Updating server status to '{status}' "
+            f"for generation {self.generation.get('_id')}"
+        )
+
+        self.log.info(f"Generation ID: {self.generation.get('_id')}")
+
+        self.log.info(f"Calling POST to {self.server_url}/update_generation_status")   
+
+        self.log.info(f"Machine ID: {self.machine_id}")
+
+        self.log.info(f"Status: {status}")
+
+        self.log.info(f"Timestamp: {self.iso_now()}") 
+        
+        payload = {
             "_id": self.generation.get("_id"),
             "status": status,
-            "time": self.iso_now()
-        })
+            "time": self.iso_now(),
+            "machine": self.machine_id
+        }
+        url = f"{self.server_url}/update_generation_status"
+        
+        self.log.info(f"Preparing to POST to {url} with payload: {payload}")
+        try:
+            self.log.info(f"POST {url}")
+            req = urllib.request.Request(
+                url=url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+
+            with urllib.request.urlopen(req, timeout=30) as res:
+                return json.loads(res.read().decode("utf-8"))
+
+        except Exception as e:
+            self.log.error(f"POST FAILED {url}: {e}")
+            return {"ok": False, "error": str(e)}
 
     def upload_rendered_media(
         self,
@@ -504,3 +801,11 @@ class VSEBuilder(Vse_renderer):
             f"{VSEBuilder.server_url}/generation_complete",
             payload
         )
+
+    def save_blend_snapshot(name):
+        output_dir = Path.home() / "VSE_Instructor_Projects"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        blend_path = output_dir / f"{name}.blend"
+
+        bpy.ops.wm.save_as_mainfile(filepath=str(blend_path))

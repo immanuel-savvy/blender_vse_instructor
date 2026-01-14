@@ -2,11 +2,13 @@ import bpy
 from .op_import_instruction import IMPORT_INSTRUCTION_OT_Operator
 from .op_apply_instruction import APPLY_INSTRUCTION_OT_Operator
 from .op_render_sequence import RENDER_SEQUENCE_OT_Operator
+from .op_start_server import VSE_INSTRUCTOR_OT_ServerToggle
 
 classes = [
     IMPORT_INSTRUCTION_OT_Operator,
     APPLY_INSTRUCTION_OT_Operator,
-    RENDER_SEQUENCE_OT_Operator
+    RENDER_SEQUENCE_OT_Operator,
+    VSE_INSTRUCTOR_OT_ServerToggle
 ]
 
 def register():

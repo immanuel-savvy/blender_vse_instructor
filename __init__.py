@@ -9,21 +9,21 @@ bl_info = {
 }
 
 import bpy
-from .core.poll_server import poll_backend_for_render
 
 # -----------------------------
 # Import Submodules
 # -----------------------------
 from . import ops
 from . import ui
+# from .core.vse_builder import start_status_worker
 
 # -----------------------------
 # Registration
 # -----------------------------
 def register():
+    # start_status_worker()
     ops.register()
     ui.register()
-    bpy.app.timers.register(poll_backend_for_render, first_interval=10)
     print("VSE Instructor registered")
 
 def unregister():
