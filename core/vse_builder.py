@@ -4,6 +4,7 @@ from pathlib import Path
 import urllib.request
 import json
 import base64
+from .timeline_resolver import TimelineResolver 
 from pathlib import Path
 from .vse_renderer import Vse_renderer
 from datetime import datetime, timezone
@@ -84,6 +85,11 @@ TRANSFORM_MAP = {
 
 }
 
+MEDIA_EXTENSIONS = {
+    "video": [".mp4", ".mov", ".mkv", ".avi", ".webm"],
+    "audio": [".wav", ".mp3", ".ogg", ".flac", ".aac"],
+    "image": [".png", ".jpg", ".jpeg", ".webp", ".tif"],
+}
 
 class VSEBuilder(Vse_renderer):
     server_url = "https://blender-backend.vercel.app"
@@ -102,6 +108,8 @@ class VSEBuilder(Vse_renderer):
         self.generation = None
         self.resolving_media = False
         self.sequencer = bpy.context.scene.sequence_editor
+
+        self.timeline = None
 
         if self.sequencer is None:
             self.log.info("No sequence editor found. Creating one...")
@@ -150,21 +158,172 @@ class VSEBuilder(Vse_renderer):
         return ".bin"  # absolute fallback
 
 
+    def _is_unresolved_clip_ref(self, clip_ref):
+        """
+        Determines whether the clip reference still represents an
+        editorial asset instead of resolved media.
+
+        Resolved media always contains a valid media type such as:
+            video
+            image
+            audio
+            text
+            scene
+
+        Unresolved assets usually contain screenplay_blocks,
+        accepted_types and preferred_type instead.
+        """
+
+        if not clip_ref:
+            return True
+
+        media_types = {
+            "video",
+            "image",
+            "audio",
+            "text",
+            "scene",
+        }
+
+        media_type = clip_ref.get("type")
+
+        if media_type in media_types:
+            return False
+
+        return (
+            "screenplay_blocks" in clip_ref
+            or "accepted_types" in clip_ref
+            or "preferred_type" in clip_ref
+        )
+
+    def _resolve_placeholder(self, clip_ref):
+        """
+        Returns an appropriate placeholder for unresolved assets.
+        """
+
+        preferred = clip_ref.get("preferred_type", "image")
+
+        if preferred == "video":
+            return str(CACHE_ROOT / "statics/video.mp4")
+
+        if preferred == "audio":
+            return str(CACHE_ROOT / "statics/audio.wav")
+
+        return str(CACHE_ROOT / "statics/image.png")
+
+    def _attach_strip_metadata(
+        self,
+        strip,
+        clip,
+        clip_ref,
+        resolved
+    ):
+        """
+        Stores editorial metadata directly on the Blender strip.
+
+        This allows assets to be replaced later without rebuilding
+        the timeline.
+        """
+
+        strip["asset_id"] = clip_ref.get("_id")
+
+        strip["instance_id"] = clip.get("instanceId")
+
+        strip["resolved"] = resolved
+
+        strip["preferred_type"] = clip_ref.get("preferred_type")
+
+        strip["accepted_types"] = json.dumps(
+            clip_ref.get("accepted_types", [])
+        )
+
+        strip["screenplay_blocks"] = json.dumps(
+            clip_ref.get("screenplay_blocks", [])
+        )
+
+        strip["description"] = clip_ref.get("description", "")
+
+    def _find_cached_media(self, clip_ref):
+        """
+        Looks for already-resolved media on disk.
+
+        Returns:
+            (filepath, media_type) or (None, None)
+        """
+        media_id = clip_ref.get("_id")
+        if not media_id:
+            return None, None
+
+        media_dir = CACHE_ROOT / media_id.replace(":", "_")
+
+        search_order = []
+
+        preferred = clip_ref.get("preferred_type")
+        if preferred:
+            search_order.append(preferred)
+
+        for t in clip_ref.get("accepted_types", []):
+            if t not in search_order:
+                search_order.append(t)
+
+        for media_type in search_order:
+            for ext in MEDIA_EXTENSIONS.get(media_type, []):
+                candidate = media_dir / f"final{ext}"
+
+                if candidate.exists():
+                    self.log.info(
+                        f"Found cached {media_type}: {candidate}"
+                    )
+                    return str(candidate), media_type
+
+        return None, None
+
     def _resolve_media(self, clip_ref):
         self.log.info(f"Resolving media: {clip_ref}")
 
-        if(not self.resolving_media): 
+        cached_path, cached_type = self._find_cached_media(clip_ref)
+
+        if cached_path:
+            return {
+                "filepath": cached_path,
+                "media_type": cached_type,
+                "resolved": True,
+            }
+
+        if self._is_unresolved_clip_ref(clip_ref):
+            preferred = clip_ref.get("preferred_type", "image")
+
+            self.log.warning(
+                f"Asset '{clip_ref.get('_id')}' unresolved. "
+                "Using placeholder."
+            )
+
+            return {
+                "filepath": self._resolve_placeholder(clip_ref),
+                "media_type": preferred,
+                "resolved": False,
+            }
+
+        if not self.resolving_media:
             self.resolving_media = True
-            self.update_server_status('RESOLVING_MEDIA')
-            
+            self.update_server_status("RESOLVING_MEDIA")
+
         media_type = clip_ref.get("type")
         media_id = clip_ref.get("_id")
 
         if media_type == "text":
-            return clip_ref.get("text", "Text strip")
-        
-        if (media_type == 'scene'):
-            return None
+            return {
+                "filepath": clip_ref.get("text", ""),
+                "media_type": "text",
+                "resolved": True,
+            }
+
+        if media_type == "scene":
+            return {
+                "filepath": None,
+                "media_type": "scene",
+                "resolved": True,
+            }
 
         if media_type not in {"video", "audio", "image"}:
             self.log.error(f"Unsupported media type: {media_type}")
@@ -178,20 +337,16 @@ class VSEBuilder(Vse_renderer):
         media_dir.mkdir(parents=True, exist_ok=True)
         chunks_dir.mkdir(parents=True, exist_ok=True)
 
-        # ----------------------------
-        # CACHE HIT
-        # ----------------------------
         if final_path.exists():
-            self.log.info(f"Using cached media: {final_path}")
-            return str(final_path)
+            return {
+                "filepath": str(final_path),
+                "media_type": media_type,
+                "resolved": True,
+            }
 
-        self.log.info("Media not cached. Fetching from server...")
+        self.log.info("Media not cached. Fetching...")
 
-        # ----------------------------
-        # DOWNLOAD CHUNKS
-        # ----------------------------
         index = 0
-        total_chunks = None
 
         while True:
             part_path = chunks_dir / f"{index:05d}.part"
@@ -208,22 +363,13 @@ class VSEBuilder(Vse_renderer):
                 return None
 
             data = response["data"]
-            base64_chunk = data["chunk"]
-            total_chunks = data["total_chunks"]
-
-            binary = base64.b64decode(base64_chunk)
+            binary = base64.b64decode(data["chunk"])
             part_path.write_bytes(binary)
 
-            self.log.info(f"Downloaded chunk {index+1}/{total_chunks}")
-
             index += 1
-            if index >= total_chunks:
-                break
 
-        # ----------------------------
-        # ASSEMBLE FINAL BINARY (ONCE)
-        # ----------------------------
-        self.log.info("Assembling final binary...")
+            if index >= data["total_chunks"]:
+                break
 
         with open(final_path, "wb") as outfile:
             for part in sorted(chunks_dir.iterdir()):
@@ -231,10 +377,12 @@ class VSEBuilder(Vse_renderer):
 
         self.log.info(f"Media assembled: {final_path}")
 
-        return str(final_path)
+        return {
+            "filepath": str(final_path),
+            "media_type": media_type,
+            "resolved": True,
+        }
 
- 
-    
     def _apply_cut_and_duration(self, strip, clip, fps):
         """
         Applies source trimming and playback duration
@@ -244,6 +392,9 @@ class VSEBuilder(Vse_renderer):
         duration_ms = clip.get("duration_ms", None)
         cut = clip.get("cut")
 
+        if duration_ms is not None:
+            duration_ms = self.timeline.resolve_ms(duration_ms)
+
         # ----------------------------
         # SOURCE IN / OUT (milliseconds)
         # ----------------------------
@@ -251,10 +402,16 @@ class VSEBuilder(Vse_renderer):
         source_end_ms = None
 
         if cut:
-            source_start_ms = int(cut.get("start_ms", 0))
-            source_end_ms = cut.get("end_ms")
-            if source_end_ms is not None:
-                source_end_ms = int(source_end_ms)
+            source_start_ms = (
+                self.timeline.resolve_ms(cut["start_ms"])
+                if cut.get("start_ms") is not None
+                else 0
+            )
+            source_end_ms = (
+                self.timeline.resolve_ms(cut["end_ms"])
+                if cut.get("end_ms") is not None
+                else None
+            )
 
         # ----------------------------
         # DETERMINE FINAL DURATION
@@ -277,16 +434,33 @@ class VSEBuilder(Vse_renderer):
         # ----------------------------
         # CONVERT TO FRAMES
         # ----------------------------
-        source_start_frame = self._ms_to_frames(source_start_ms, fps)
+        self.log.info(
+            f"""
+            duration_ms={duration_ms}
+            source_start_ms={source_start_ms}
+            source_end_ms={source_end_ms}
+            available_ms={available_ms}
+            final_duration_ms={final_duration_ms}
+            """
+        )
+
+        source_start_frame = self.resolve_frame(source_start_ms)
 
         if final_duration_ms is not None:
             final_duration_frames = max(
                 1,
-                self._ms_to_frames(final_duration_ms, fps)
+                self.resolve_frame(final_duration_ms)
             )
         else:
             # play remaining media
             final_duration_frames = strip.frame_duration - source_start_frame
+
+        self.log.info(
+            f"""
+            source_start_frame={source_start_frame}
+            final_duration_frames={final_duration_frames}
+            """
+        )
 
         # ----------------------------
         # APPLY TO STRIP (CRITICAL)
@@ -305,36 +479,46 @@ class VSEBuilder(Vse_renderer):
             f"duration={final_duration_ms}ms"
         )
 
-            
-    #-------------------------------------------------------------------
-    def _ms_to_frames(self, ms, fps=24):
-        frames = int((ms / 1000.0) * fps)
-        self.log.info(f"Converting ms → frames: {ms}ms @ {fps}fps = {frames}")
-        return frames
-
     #-----------------------------------------------------------------------
     # VIDEO + AUDIO PAIR
     # -------------------------------------------------------------------------
-    def _add_video_clip(self, clip, sequence_payload):
+    def _add_video_clip(self, clip, sequence_payload, track_id=None):
         try:
+            # Log one clip payload for debugging inconsistent time formats
+            try:
+                self.log.info(json.dumps(clip, indent=2))
+            except Exception:
+                self.log.info(f"clip: {clip}")
+
             fps = sequence_payload.get("fps", 24)
             clip_ref = clip.get("clip_ref")
-            filepath = self._resolve_media(clip_ref)
+            media = clip["_resolved_media"]
+            filepath = media["filepath"]
+            resolved = media["resolved"]
             name = clip.get("instanceId")
 
-            start_ms = int(clip.get("start_ms", 0))
             layer = int(clip.get("layer", 1))
 
-            start_frame = self._ms_to_frames(start_ms, fps)
+            start_frame = self.timeline.resolve_frame(
+                clip["start_ms"]
+            )
+            asset_id = clip_ref.get("_id", "unknown")
 
             # ----------------------------
             # CREATE VIDEO STRIP
             # ----------------------------
             video = self.sequencer.sequences.new_movie(
-                name=f"{name}_VID",
+                name=f"{asset_id}_VID",
                 filepath=filepath,
                 frame_start=start_frame,
                 channel=layer
+            )
+
+            self._attach_strip_metadata(
+                video,
+                clip,
+                clip_ref,
+                resolved
             )
 
             self._apply_cut_and_duration(video, clip, fps)
@@ -343,12 +527,18 @@ class VSEBuilder(Vse_renderer):
             # CREATE AUDIO STRIP
             # ----------------------------
             audio = self.sequencer.sequences.new_sound(
-                name=f"{name}_AUD",
+                name=f"{asset_id}_AUD",
                 filepath=filepath,
                 frame_start=start_frame,
                 channel=layer + 1
             )
-            # audio.use_sound_length = False
+
+            self._attach_strip_metadata(
+                audio,
+                clip,
+                clip_ref,
+                resolved
+            )
 
             self._apply_cut_and_duration(audio, clip, fps)
 
@@ -365,17 +555,21 @@ class VSEBuilder(Vse_renderer):
     # -------------------------------------------------------------------------
     # AUDIO ONLY
     # -------------------------------------------------------------------------
-    def _add_audio_clip(self, clip, payload):
+    def _add_audio_clip(self, clip, payload, track_id):
         try:
             self.log.info(f"Adding AUDIO ONLY clip: {clip}")
 
             fps = payload.get("fps")
 
-            name = clip.get("instanceId")
+            name = clip.get("_id", clip.get("instanceId", "unknown"))
             clip_ref = clip.get("clip_ref")
-            filepath = self._resolve_media(clip_ref)
+            media = clip["_resolved_media"]
+            filepath = media["filepath"]
+            resolved = media["resolved"]
 
-            start_frame = self._ms_to_frames(int(clip.get('start_ms', 0)), fps)
+            start_frame = self.resolve_frame(self.timeline.resolve_ms(
+                clip.get("start_ms", 0)
+            ))
             layer = int(clip.get('layer', 1))
 
             audio = self.sequencer.sequences.new_sound(
@@ -383,6 +577,13 @@ class VSEBuilder(Vse_renderer):
                 filepath=filepath,
                 frame_start=start_frame,
                 channel=layer
+            )
+
+            self._attach_strip_metadata(
+                audio,
+                clip,
+                clip_ref,
+                resolved
             )
 
             self._apply_cut_and_duration(audio, clip, fps)
@@ -397,16 +598,26 @@ class VSEBuilder(Vse_renderer):
     # -------------------------------------------------------------------------
     # TEXT STRIP
     # -------------------------------------------------------------------------
-    def _add_text_clip(self, clip, sequence_payload):
+    def _add_text_clip(self, clip, sequence_payload, track_id):
         try:
             self.log.info(f"Adding TEXT clip: {clip}")
 
-            name = clip.get('instanceId')
-            start_ms = clip.get('start_ms', 0)
-            duration_ms = clip.get('duration_ms', 5000)
+            name = clip.get('_id', clip.get('instanceId', 'unknown'))
+            start_ms = self.timeline.resolve_ms(
+                clip.get('start_ms')
+            )
+            duration_ms = self.timeline.resolve_ms(
+                clip.get(
+                    'duration_ms',
+                    {
+                        'type': 'milliseconds',
+                        'value': 5000
+                    }
+                )
+            )
 
-            start_frame = self._ms_to_frames(start_ms)
-            end_frame = self._ms_to_frames(start_ms + duration_ms)
+            start_frame = self.resolve_frame(start_ms)
+            end_frame = self.resolve_frame(start_ms + duration_ms)
             layer = int(clip.get('layer', 1))
 
             clip_ref = clip.get("clip_ref", {})
@@ -423,7 +634,18 @@ class VSEBuilder(Vse_renderer):
                 channel=layer
             )
 
-            txt.text = text
+            resolved = not self._is_unresolved_clip_ref(clip_ref)
+
+            self._attach_strip_metadata(
+                txt,
+                clip,
+                clip_ref,
+                resolved
+            )
+
+            txt.text = text or "Text strip"
+            self._apply_text_config(txt, clip)
+
             self.log.info(f"Created TEXT strip: {txt.name}")
 
             return txt
@@ -434,33 +656,65 @@ class VSEBuilder(Vse_renderer):
 
     # -----------------------------------------------------
 
-    def _add_image_clip(self, clip, sequence_payload):
+    def _add_image_clip(self, clip, sequence_payload, track_id):
         try:
             self.log.info(f"Adding IMAGE clip: {clip}")
 
             fps = sequence_payload.get("fps", 24)
             clip_ref = clip.get("clip_ref")
-            filepath = self._resolve_media(clip_ref)
+            media = clip["_resolved_media"]
+            filepath = media["filepath"]
+            resolved = media["resolved"]
             if not filepath:
                 self.log.error("Failed to resolve image media.")
                 return None
 
-            name = clip.get("instanceId")
-            start_ms = int(clip.get("start_ms", 0))
-            duration_ms = int(clip.get("duration_ms", 5000) ) # default 5s
-            start_frame = self._ms_to_frames(start_ms, fps)
-            duration_frames = self._ms_to_frames(duration_ms, fps)
+            name = clip.get("_id", clip.get("instanceId", "unknown"))
+            start_ms = self.timeline.resolve_ms(
+                clip.get("start_ms")
+            )
+            duration_ms = self.timeline.resolve_ms(
+                clip.get(
+                    "duration_ms",
+                    {
+                        "type": "milliseconds",
+                        "value": 5000
+                    }
+                )
+            )
+            start_frame = self.resolve_frame(start_ms)
+            duration_frames = max(
+                1,
+                self.resolve_frame(duration_ms)
+            )
             layer = int(clip.get("layer", 1))
 
             image_strip = self.sequencer.sequences.new_image(
                 name=f"{name}_IMG",
                 filepath=filepath,
                 frame_start=start_frame,
+                frame_end=start_frame + duration_frames,
                 channel=layer
             )
-            image_strip.frame_final_duration = duration_frames
 
-            self.log.info(f"Created IMAGE strip: {image_strip.name} from frame {start_frame} to {start_frame+duration_frames}")
+            self._attach_strip_metadata(
+                image_strip,
+                clip,
+                clip_ref,
+                resolved
+            )
+
+            self._apply_cut_and_duration(
+                image_strip,
+                clip,
+                fps
+            )
+
+            self.log.info(
+                f"Created IMAGE strip: {image_strip.name} "
+                f"from frame {image_strip.frame_start} "
+                f"to {image_strip.frame_final_end}"
+            )
             return image_strip
 
         except Exception as e:
@@ -468,6 +722,122 @@ class VSEBuilder(Vse_renderer):
             return None
 
 
+    def _hex_to_rgba(self, value):
+        value = value.lstrip("#")
+
+        if len(value) == 6:
+            r = int(value[0:2], 16) / 255
+            g = int(value[2:4], 16) / 255
+            b = int(value[4:6], 16) / 255
+            a = 1.0
+
+        elif len(value) == 8:
+            r = int(value[0:2], 16) / 255
+            g = int(value[2:4], 16) / 255
+            b = int(value[4:6], 16) / 255
+            a = int(value[6:8], 16) / 255
+
+        else:
+            return (1, 1, 1, 1)
+
+        return (r, g, b, a)
+
+    def _apply_text_config(self, strip, clip):
+        """
+        Applies the Editorial text configuration onto a Blender TEXT strip.
+
+        The renderer never invents styles.
+        It only applies whatever exists inside clip["text"].
+        """
+
+        cfg = clip.get("text")
+        if not cfg:
+            return
+
+        override = cfg.get("override", {})
+
+        # ----------------------------------------------------
+        # Placement
+        # ----------------------------------------------------
+
+        placement = override.get("placement")
+
+        if placement:
+
+            placement_map = {
+                "top_left": (0.05, 0.90),
+                "top_center": (0.50, 0.90),
+                "top_right": (0.95, 0.90),
+
+                "center_left": (0.05, 0.50),
+                "center": (0.50, 0.50),
+                "center_right": (0.95, 0.50),
+
+                "bottom_left": (0.05, 0.10),
+                "bottom_center": (0.50, 0.10),
+                "bottom_right": (0.95, 0.10),
+            }
+
+            if placement in placement_map:
+                x, y = placement_map[placement]
+                strip.location.x = x
+                strip.location.y = y
+
+        # ----------------------------------------------------
+        # Style
+        # ----------------------------------------------------
+
+        style = override.get("style", {})
+
+        if "font_size" in style:
+            strip.font_size = style["font_size"]
+
+        if "font" in style:
+            font = bpy.data.fonts.get(style["font"])
+            if font:
+                strip.font = font
+
+        if "bold" in style:
+            strip.use_bold = style["bold"]
+
+        if "italic" in style:
+            strip.use_italic = style["italic"]
+
+        if "shadow" in style:
+            strip.use_shadow = style["shadow"]
+
+        if "outline" in style:
+            strip.use_outline = style["outline"]
+
+        if "outline_width" in style:
+            strip.outline_width = style["outline_width"]
+
+        if "line_spacing" in style:
+            strip.line_spacing = style["line_spacing"]
+
+        if "align_x" in style:
+            strip.align_x = style["align_x"].upper()
+
+        if "align_y" in style:
+            strip.align_y = style["align_y"].upper()
+
+        # ----------------------------------------------------
+        # Color
+        # ----------------------------------------------------
+
+        color = style.get("color")
+
+        if color:
+            strip.color = self._hex_to_rgba(color)
+
+        outline_color = style.get("outline_color")
+        if outline_color:
+            strip.outline_color = self._hex_to_rgba(outline_color)
+
+        shadow_color = style.get("shadow_color")
+        if shadow_color:
+            strip.shadow_color = self._hex_to_rgba(shadow_color)
+            
     def _ensure_transform_strip(self, base_strip, finding=False):
         for s in self.sequencer.sequences:
             if (
@@ -490,13 +860,26 @@ class VSEBuilder(Vse_renderer):
         )
 
 
-    def _resolve_keyframe_time(self, t, start_frame, duration_frames, fps):
-        if isinstance(t, str) and t.endswith("%"):
-            pct = float(t[:-1]) / 100.0
-            return start_frame + int(duration_frames * pct)
+    def _resolve_keyframe_time(
+        self,
+        t,
+        clip
+    ):
 
-        # assume ms
-        return start_frame + self._ms_to_frames(t, fps)
+        if isinstance(t,str) and t.endswith("%"):
+
+            pct=float(t[:-1])/100
+
+            return (
+                clip.frame_start +
+                int(
+                    clip.frame_final_duration *
+                    pct
+                )
+            )
+
+
+        return self.timeline.resolve_frame(t)
 
     def _apply_transforms(self, clip, base_strip):
         transforms = clip.get("transforms")
@@ -557,7 +940,8 @@ class VSEBuilder(Vse_renderer):
 
                 for kf in keyframes:
                     frame = self._resolve_keyframe_time(
-                        kf["t"], start, duration, fps
+                        kf["t"],
+                        base_strip
                     )
                     value = kf["v"]
 
@@ -578,71 +962,132 @@ class VSEBuilder(Vse_renderer):
     # MAIN BUILD
     # -------------------------------------------------------------------------
     def build(self):
-        self.log.info("===== BEGIN VSE BUILD =====")
 
-        self._clear_sequencer()
-        
         seq = self.instruction.get("sequence", self.instruction)
-        fps = seq.get("fps", 24)
-        tracks = seq.get("tracks", [])
 
-        self.log.info(f"Sequence FPS: {fps}")
-        self.log.info(f"Tracks found: {len(tracks)}")
+        fps = seq.get("fps",24)
 
-        if not tracks:
-            self.log.error("No tracks found. Nothing to build.")
-            return
+        self.timeline = TimelineResolver(
+            seq,
+            fps
+        )
+        self._clear_sequencer()
 
-        for track_index, track in enumerate(tracks):
-            self.log.info(f"=== Processing Track #{track_index} ===")
-            self.log.info(f"Track data: {track}")
+        tracks = seq["tracks"]
 
-            track_payload = {"track": track, "fps": fps}
+        #
+        # PASS 1
+        # Editorial graph
+        #
 
-            for clip_index, clip in enumerate(track.get("clips", [])):
-                self.log.info(f"-- Clip #{clip_index}: {clip}")
+        for index, track in enumerate(tracks):
 
-                clip_ref = clip.get("clip_ref", {})
-                mediatype = clip_ref.get("type")
-                self.log.info(f"Mediatype = {mediatype}")
+            track_id = track.get(
+                "_id",
+                f"track-{index}"
+            )
 
-                strip = None
-                video_strip = None
-                audio_strip = None
+            track["_id"] = track_id
 
-                if mediatype == "video":
-                    result = self._add_video_clip(clip, track_payload)
+            self.timeline.register_track(
+                track_id
+            )
 
-                    if result:
-                        video_strip, audio_strip = result
+            for clip in track["clips"]:
 
-                elif mediatype == "audio":
-                    audio_strip = self._add_audio_clip(clip, track_payload)
+                self.timeline.register_clip(
+                    clip,
+                    track_id
+                )
 
-                elif mediatype == "text":
-                    strip = self._add_text_clip(clip, track_payload)
+        #
+        # PASS 2
+        # Blender compilation
+        #
 
-                elif mediatype == "image":
-                    strip = self._add_image_clip(clip, track_payload)
+        for track in tracks:
 
-                else:
-                    self.log.error(f"Unsupported mediatype: {mediatype}")
+            for clip in track["clips"]:
 
-                # Apply transform strips
-                if video_strip:
-                    self._apply_transforms(clip, video_strip)
-
-                if audio_strip:
-                    self._apply_transforms(clip, audio_strip)
-
-                if strip:
-                    self._apply_transforms(clip, strip)
+                self.compile_clip(
+                    clip,
+                    track,
+                    fps
+                )
 
 
-        self.resolving_media = False
-        self.setup_timeline_from_output(self.instruction.get('output', {}))
+    def compile_clip(
+        self,
+        clip,
+        track,
+        fps
+    ):
 
-        self.log.info("===== VSE BUILD COMPLETE =====")
+        clip_ref = clip.get(
+            "clip_ref",
+            {}
+        )
+
+        media = self._resolve_media(clip_ref)
+
+        if not media:
+            return None
+
+        media_type = media["media_type"]
+
+        clip["_resolved_media"] = media
+
+        strip = None
+
+        if media_type == "video":
+            result = self._add_video_clip(
+                clip,
+                {
+                    "fps": fps
+                },
+                track["_id"]
+            )
+
+            if isinstance(result, tuple) and len(result) == 2:
+                video, _audio = result
+                strip = video
+            else:
+                strip = result
+
+        elif media_type == "audio":
+            strip = self._add_audio_clip(
+                clip,
+                {"fps": fps},
+                track["_id"]
+            )
+
+        elif media_type == "image":
+            strip = self._add_image_clip(
+                clip,
+                track,
+                track["_id"]
+            )
+
+        elif media_type == "text":
+            strip = self._add_text_clip(
+                clip,
+                {"fps": fps},
+                track["_id"]
+            )
+
+        if strip:
+            self._apply_transforms(
+                clip,
+                strip
+            )
+
+        return strip
+   
+    def resolve_time(self, value):
+        return self.timeline.resolve_ms(value)
+
+    def resolve_frame(self, value):
+        return self.timeline.resolve_frame(value)
 
     def _clear_sequencer(self):
         seq = self.sequencer
