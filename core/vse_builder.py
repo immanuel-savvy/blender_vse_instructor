@@ -244,15 +244,9 @@ class VSEBuilder(Vse_renderer):
         strip["description"] = clip_ref.get("description", "")
 
     def _find_cached_media(self, clip_ref):
-        """
-        Looks for already-resolved media on disk.
-
-        Returns:
-            (filepath, media_type) or (None, None)
-        """
         media_id = clip_ref.get("_id")
         if not media_id:
-            return None, None
+            return None
 
         media_dir = CACHE_ROOT / media_id.replace(":", "_")
 
@@ -271,22 +265,25 @@ class VSEBuilder(Vse_renderer):
                 candidate = media_dir / f"final{ext}"
 
                 if candidate.exists():
-                    self.log.info(
-                        f"Found cached {media_type}: {candidate}"
-                    )
-                    return str(candidate), media_type
+                    return {
+                        "filepath": str(candidate),
+                        "media_type": media_type,
+                        "clip_ref": {
+                            **clip_ref,
+                            "type": media_type,
+                        },
+                    }
 
-        return None, None
+        return None
 
     def _resolve_media(self, clip_ref):
         self.log.info(f"Resolving media: {clip_ref}")
 
-        cached_path, cached_type = self._find_cached_media(clip_ref)
+        cached = self._find_cached_media(clip_ref)
 
-        if cached_path:
+        if cached:
             return {
-                "filepath": cached_path,
-                "media_type": cached_type,
+                **cached,
                 "resolved": True,
             }
 
@@ -622,7 +619,7 @@ class VSEBuilder(Vse_renderer):
 
             clip_ref = clip.get("clip_ref", {})
             
-            text = clip_ref.get("text")
+            text = clip_ref.get("value")
 
             self.log.info(f"TEXT '{text}' from {start_frame} → {end_frame}")
 
@@ -689,13 +686,17 @@ class VSEBuilder(Vse_renderer):
             )
             layer = int(clip.get("layer", 1))
 
+            # Blender 4.x: new_image signature changed and no longer accepts frame_end
+            # Create the strip first, then set its duration
             image_strip = self.sequencer.sequences.new_image(
-                name=f"{name}_IMG",
-                filepath=filepath,
-                frame_start=start_frame,
-                frame_end=start_frame + duration_frames,
-                channel=layer
+                f"{name}_IMG",
+                filepath,
+                layer,
+                start_frame,
             )
+
+            # Set duration in frames
+            image_strip.frame_final_duration = duration_frames
 
             self._attach_strip_metadata(
                 image_strip,
@@ -958,6 +959,30 @@ class VSEBuilder(Vse_renderer):
                     )
 
 
+    def calculate_timeline_range(self):
+        """
+        Returns:
+            (start_frame, end_frame, duration_frames)
+        """
+
+        strips = list(self.sequencer.sequences_all)
+
+        if not strips:
+            return 0, 0, 0
+
+        start = min(s.frame_final_start for s in strips)
+        end = max(s.frame_final_end for s in strips)
+
+        return start, end, end - start
+
+    def fit_scene_to_timeline(self):
+        scene = bpy.context.scene
+
+        start, end, _ = self.calculate_timeline_range()
+
+        scene.frame_start = start
+        scene.frame_end = end - 1    # Blender's end frame is inclusive
+
     # -------------------------------------------------------------------------
     # MAIN BUILD
     # -------------------------------------------------------------------------
@@ -1015,6 +1040,7 @@ class VSEBuilder(Vse_renderer):
                     fps
                 )
 
+        self.fit_scene_to_timeline()
 
     def compile_clip(
         self,
@@ -1029,6 +1055,7 @@ class VSEBuilder(Vse_renderer):
         )
 
         media = self._resolve_media(clip_ref)
+        self.log.info(media)
 
         if not media:
             return None
@@ -1036,6 +1063,9 @@ class VSEBuilder(Vse_renderer):
         media_type = media["media_type"]
 
         clip["_resolved_media"] = media
+
+        if "clip_ref" in media:
+            clip["clip_ref"] = media["clip_ref"]
 
         strip = None
 
@@ -1064,7 +1094,7 @@ class VSEBuilder(Vse_renderer):
         elif media_type == "image":
             strip = self._add_image_clip(
                 clip,
-                track,
+                {"fps": fps},
                 track["_id"]
             )
 
