@@ -1548,39 +1548,94 @@ class VSEBuilder(Vse_renderer):
 
             if strip is not None:
 
-                try:
+                self._remove_strip_safely(strip)
 
-                    strip_name = strip.name
+    def _remove_strip_safely(
+        self,
+        strip,
+        max_attempts=2,
+    ):
+        """
+        Remove a strip and CONFIRM it's actually gone, rather than
+        trusting a bare remove() call. If a probe strip survives, it
+        sits on PROBE_CHANNEL and causes the *next* probe created at
+        the same (channel, frame) to collide and get bumped to the
+        next channel up - which is how stray content ends up on
+        channel 10 (or higher) even though nothing is ever
+        deliberately placed there.
+        """
 
-                    # FIX: bpy's Sequences.remove() does not accept a
-                    # do_unlink keyword argument - only new_movie/etc.
-                    # style constructors and some bpy.data collections
-                    # (e.g. bpy.data.meshes.remove) support that kwarg.
-                    # Passing it here raised a TypeError on every single
-                    # call, which this except block silently swallowed
-                    # (logged, not re-raised) - so every probe strip
-                    # ever created was left behind permanently instead
-                    # of being cleaned up. That's why probe strips
-                    # accumulate on the probe channel across a build.
-                    self.sequencer.sequences.remove(
-                        strip
-                    )
+        name = getattr(strip, "name", "<unknown>")
 
-                    self.log.info(
-                        f"[PROBE] Removed "
-                        f"temporary strip "
-                        f"'{strip_name}'"
-                    )
+        for attempt in range(1, max_attempts + 1):
 
-                except Exception as remove_error:
+            try:
 
-                    self.log.error(
-                        f"[PROBE] Failed removing "
-                        f"temporary strip "
-                        f"'{getattr(strip, 'name', '<unknown>')}': "
-                        f"{remove_error}"
-                    )
+                self.sequencer.sequences.remove(strip)
 
+            except Exception as e:
+
+                self.log.warning(
+                    f"[PROBE] remove() raised for "
+                    f"'{name}' (attempt {attempt}): {e}"
+                )
+
+            still_present = self.sequencer.sequences.get(name)
+
+            if still_present is None:
+
+                self.log.info(
+                    f"[PROBE] Removed temporary strip '{name}'"
+                )
+
+                return True
+
+            self.log.warning(
+                f"[PROBE] Strip '{name}' still present after "
+                f"remove() attempt {attempt}"
+            )
+
+            strip = still_present
+
+        self.log.error(
+            f"[PROBE] Could not remove probe strip '{name}' "
+            f"after {max_attempts} attempt(s) - it will be "
+            f"purged in the end-of-pass sweep."
+        )
+
+        return False
+
+
+    def _purge_stray_probe_strips(self):
+        """
+        Belt-and-suspenders: remove anything left on or above
+        PROBE_CHANNEL after probing finishes. Nothing in a normal
+        build is ever deliberately placed there, so if this finds
+        anything, a probe removal failed somewhere - this guarantees
+        it can't survive into the final render regardless.
+        """
+
+        stray = [
+            s for s in self.sequencer.sequences_all
+            if s.channel >= PROBE_CHANNEL
+        ]
+
+        for s in stray:
+
+            name = s.name
+            channel = s.channel
+
+            try:
+                self.sequencer.sequences.remove(s)
+                self.log.warning(
+                    f"[PROBE] Purged stray strip '{name}' "
+                    f"left on channel {channel}"
+                )
+            except Exception as e:
+                self.log.error(
+                    f"[PROBE] Failed to purge stray strip "
+                    f"'{name}' on channel {channel}: {e}"
+                )
     # =========================================================================
     # CRITICAL: LAZY DURATION PROVIDER
     # =========================================================================
@@ -2495,6 +2550,8 @@ class VSEBuilder(Vse_renderer):
                     fps,
                 )
 
+        self._purge_stray_probe_strips()
+
         self.log.info(
             f"[BUILD] Probed "
             f"{len(self._native_durations)} "
@@ -2575,7 +2632,8 @@ class VSEBuilder(Vse_renderer):
         # ---------------------------------------------------------------------
         # FINISH
         # ---------------------------------------------------------------------
-
+        self._purge_stray_probe_strips()
+        
         self.fit_scene_to_timeline()
 
         self.update_server_status(
