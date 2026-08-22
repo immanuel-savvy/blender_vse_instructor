@@ -30,31 +30,32 @@ REFERENCE_PATTERN = re.compile(
 
 # ============================================================
 #
-# RESOLUTION POLICY
+# TIMELINE POSITIONING
 #
 # ============================================================
 
 #
+# Blender timelines conventionally begin at frame 1.
+#
+# This prevents the first strip from occupying frame 0 and gives
+# the VSE a deterministic initial insertion position.
+#
+
+TIMELINE_START_FRAME = 1
+
+
+#
+# Leave one frame between editorial scenes.
+#
+# This is deliberately expressed in frames rather than milliseconds
+# because the VSE ultimately operates in frames.
+#
+
+SCENE_GAP_FRAMES = 1
+
+
+#
 # A percentage-only scene has no mathematically unique duration.
-#
-# Example:
-#
-#     clip.duration = 10% of scene
-#
-# could represent:
-#
-#     1 second
-#     10 seconds
-#     100 seconds
-#     ...
-#
-# There is no absolute information from which to derive the scale.
-#
-# Instead of allowing that case to crash Blender, the resolver uses
-# a deterministic fallback.
-#
-# This value is ONLY used when the scene is mathematically
-# underdetermined.
 #
 
 UNDERDETERMINED_SCENE_DURATION_MS = 1000
@@ -106,8 +107,22 @@ class TimelineObject:
     clip: dict | None = None
     track_id: str | None = None
 
+    # --------------------------------------------------------
     # Resolved timeline values.
+    #
     # All values are milliseconds.
+    #
+    # For editorial scenes:
+    #
+    #   start/end = absolute timeline position
+    #   duration  = local scene duration
+    #
+    # For clips:
+    #
+    #   start/end = absolute timeline position
+    #   duration  = clip duration
+    # --------------------------------------------------------
+
     start: int = 0
     end: int = 0
     duration: int = 0
@@ -122,6 +137,18 @@ class TimelineObject:
 
     # Internal percentage state.
     percentage_resolving: bool = False
+
+    # --------------------------------------------------------
+    #
+    # Local timeline values.
+    #
+    # These are primarily useful for editorial scenes.
+    #
+    # --------------------------------------------------------
+
+    local_start: int = 0
+    local_end: int = 0
+    local_duration: int = 0
 
     @property
     def center(self):
@@ -150,15 +177,16 @@ class TimelineResolver:
         self.sequence = sequence
         self.fps = fps
 
-        # The resolver owns timing mathematics and references, while the
-        # host application supplies durations through this callback.
-        # This keeps TimelineResolver reusable outside Blender.
+        #
+        # The host application supplies actual media duration.
+        #
+
         self.duration_provider = (
             duration_provider
         )
 
         #
-        # Global timeline
+        # Global timeline.
         #
 
         self.scene = TimelineObject(
@@ -166,28 +194,28 @@ class TimelineResolver:
         )
 
         #
-        # Editorial tracks
+        # Editorial tracks.
         #
 
         self.tracks = {}
         self.track_order = []
 
         #
-        # Clips
+        # Clips.
         #
 
         self.clips = {}
         self.clip_order = []
 
         #
-        # Editorial scenes
+        # Editorial scenes.
         #
 
         self.editorial_scenes = {}
         self.editorial_scene_order = []
 
         #
-        # Resolution phase
+        # Resolution phase.
         #
 
         self.phase = None
@@ -207,9 +235,8 @@ class TimelineResolver:
         #
         # Resolved percentage bases.
         #
-        #
         # {
-        #     "edscene-001": 120000
+        #     "scene-001": 120000
         # }
         #
 
@@ -239,6 +266,32 @@ class TimelineResolver:
 
         return round(
             frames * 1000 / self.fps
+        )
+
+    # --------------------------------------------------------
+
+    def timeline_start_ms(
+        self
+    ):
+        """
+        Absolute start of the editorial timeline.
+        """
+
+        return self.frames_to_ms(
+            TIMELINE_START_FRAME
+        )
+
+    # --------------------------------------------------------
+
+    def scene_gap_ms(
+        self
+    ):
+        """
+        Gap between editorial scenes.
+        """
+
+        return self.frames_to_ms(
+            SCENE_GAP_FRAMES
         )
 
     # ========================================================
@@ -295,10 +348,6 @@ class TimelineResolver:
         if value is None:
             return 0
 
-        #
-        # Already numeric.
-        #
-
         if isinstance(
             value,
             (int, float)
@@ -352,19 +401,29 @@ class TimelineResolver:
 
         if timing_type == "from_strip":
 
-            clip_id = value.get("clip_id")
+            source_clip_id = value.get(
+                "clip_id"
+            )
 
-            if not clip_id:
+            if not source_clip_id:
+
                 raise TimelineResolutionError(
-                    f"from_strip timing requires 'clip_id': {value!r}"
+                    f"from_strip timing requires "
+                    f"'clip_id': {value!r}"
                 )
 
             if self.duration_provider is None:
+
                 raise TimelineResolutionError(
-                    f"No duration provider available for clip '{clip_id}'."
+                    f"No duration provider available "
+                    f"for clip '{source_clip_id}'."
                 )
 
-            return int(self.duration_provider(clip_id))
+            return int(
+                self.duration_provider(
+                    source_clip_id
+                )
+            )
 
         # ----------------------------------------------------
         # seconds
@@ -387,7 +446,7 @@ class TimelineResolver:
             ):
 
                 raise TimelineResolutionError(
-                    f"Invalid milliseconds value: "
+                    f"Invalid seconds value: "
                     f"{value!r}"
                 )
 
@@ -454,25 +513,6 @@ class TimelineResolver:
         value,
         clip_id=None
     ):
-        """
-        Resolve percentage timing.
-
-        Percentage values are ALWAYS measured against a duration.
-
-        If `of` is omitted, the current clip's editorial scene
-        becomes the percentage basis.
-
-        Example:
-
-            {
-                "type": "percentage",
-                "value": 5
-            }
-
-        means:
-
-            5% of the current editorial scene duration.
-        """
 
         try:
 
@@ -505,18 +545,13 @@ class TimelineResolver:
                 f"got {percentage}"
             )
 
-        #
-        # Determine target.
-        #
-
         target = value.get(
             "of"
         )
 
         #
-        # No explicit target.
-        #
-        # Use current clip's editorial scene.
+        # No explicit target means the current clip's
+        # editorial scene.
         #
 
         if target is None:
@@ -558,11 +593,6 @@ class TimelineResolver:
 
             if not editorial_scene_id:
 
-                #
-                # A percentage without an editorial scene
-                # cannot implicitly select a basis.
-                #
-
                 raise TimelinePercentageResolutionError(
                     f"Percentage timing for clip "
                     f"'{clip_id}' requires an "
@@ -581,10 +611,6 @@ class TimelineResolver:
                 target
             )
         )
-
-        #
-        # Editorial scene target.
-        #
 
         scene_id = (
             self._percentage_target_editorial_scene(
@@ -631,10 +657,6 @@ class TimelineResolver:
         self,
         target
     ):
-        """
-        Return the editorial scene ID when the target refers to
-        an editorial scene's duration.
-        """
 
         if not isinstance(
             target,
@@ -646,7 +668,6 @@ class TimelineResolver:
         tokens = target.split(":")
 
         if len(tokens) != 3:
-
             return None
 
         structure, selector, prop = tokens
@@ -668,34 +689,6 @@ class TimelineResolver:
         self,
         target
     ):
-        """
-        Normalize percentage targets.
-
-        Supported:
-
-            "scene"
-
-            "scene:edscene-001"
-
-            "scene:edscene-001:duration"
-
-            "clip:clip-001"
-
-            "clip:clip-001:duration"
-
-            "track:track-001"
-
-            "track:track-001:duration"
-
-            {
-                "type": "reference",
-                "value": "scene:edscene-001:duration"
-            }
-        """
-
-        #
-        # Reference object.
-        #
 
         if isinstance(
             target,
@@ -725,10 +718,6 @@ class TimelineResolver:
                 f"{target!r}"
             )
 
-        #
-        # Bare editorial scene ID.
-        #
-
         if target in self.editorial_scenes:
 
             return (
@@ -737,19 +726,11 @@ class TimelineResolver:
                 f"duration"
             )
 
-        #
-        # Bare global scene.
-        #
-
         if target == "scene":
 
             return (
                 "scene:duration"
             )
-
-        #
-        # Bare clip.
-        #
 
         if target in self.clips:
 
@@ -759,10 +740,6 @@ class TimelineResolver:
                 f"duration"
             )
 
-        #
-        # Bare track.
-        #
-
         if target in self.tracks:
 
             return (
@@ -770,10 +747,6 @@ class TimelineResolver:
                 f"{target}:"
                 f"duration"
             )
-
-        #
-        # Explicit two-part target.
-        #
 
         tokens = target.split(":")
 
@@ -810,10 +783,6 @@ class TimelineResolver:
                         f"{selector}:"
                         f"duration"
                     )
-
-        #
-        # Already complete.
-        #
 
         return target
 
@@ -885,19 +854,11 @@ class TimelineResolver:
             clip_id
         )
 
-        #
-        # Track membership.
-        #
-
         self.tracks[
             track_id
         ].clips.append(
             obj
         )
-
-        #
-        # Editorial scene membership.
-        #
 
         scene_id = clip.get(
             "editorial_scene"
@@ -928,6 +889,42 @@ class TimelineResolver:
 
     # ========================================================
     #
+    # DEFAULT DURATION
+    #
+    # ========================================================
+
+    def _default_duration_ms(
+        self,
+        clip_id
+    ):
+
+        if self.duration_provider is not None:
+
+            return int(
+                self.duration_provider(
+                    clip_id
+                )
+            )
+
+        raise TimelineResolutionError(
+            f"No duration provider available "
+            f"for clip '{clip_id}'."
+        )
+
+    # --------------------------------------------------------
+
+    def _default_duration_value(
+        self,
+        clip_id
+    ):
+
+        return {
+            "type": "from_strip",
+            "clip_id": clip_id
+        }
+
+    # ========================================================
+    #
     # PERCENTAGE DEPENDENCY ANALYSIS
     #
     # ========================================================
@@ -939,21 +936,9 @@ class TimelineResolver:
         clip_id=None,
         visited=None
     ):
-        """
-        Determine whether a timing value ultimately depends on
-        the duration of an editorial scene.
-
-        This function is used only for dependency analysis.
-
-        It does NOT resolve timing.
-        """
 
         if visited is None:
             visited = set()
-
-        #
-        # Numeric values are absolute.
-        #
 
         if isinstance(
             value,
@@ -976,30 +961,19 @@ class TimelineResolver:
             "type"
         )
 
-        #
-        # Absolute timing.
-        #
-
         if timing_type in {
             "milliseconds",
             "seconds",
+            "from_strip",
         }:
 
             return False
-
-        #
-        # Percentage.
-        #
 
         if timing_type == "percentage":
 
             target = value.get(
                 "of"
             )
-
-            #
-            # No explicit target.
-            #
 
             if target is None:
 
@@ -1046,19 +1020,11 @@ class TimelineResolver:
             if target_scene == scene_id:
                 return True
 
-            #
-            # Percentage of another object.
-            #
-
             return self._reference_depends_on_scene(
                 target,
                 scene_id,
                 visited
             )
-
-        #
-        # Reference.
-        #
 
         if timing_type == "reference":
 
@@ -1067,10 +1033,6 @@ class TimelineResolver:
                 scene_id,
                 visited
             )
-
-        #
-        # Expression.
-        #
 
         if timing_type == "expression":
 
@@ -1113,10 +1075,6 @@ class TimelineResolver:
         scene_id,
         visited=None
     ):
-        """
-        Recursively determine whether a reference eventually
-        depends on an editorial scene's duration.
-        """
 
         if visited is None:
             visited = set()
@@ -1134,11 +1092,6 @@ class TimelineResolver:
         )
 
         if key in visited:
-
-            #
-            # Cyclic dependency.
-            #
-
             return True
 
         visited.add(
@@ -1146,10 +1099,6 @@ class TimelineResolver:
         )
 
         tokens = ref.split(":")
-
-        #
-        # scene:duration
-        #
 
         if len(tokens) == 2:
 
@@ -1159,15 +1108,6 @@ class TimelineResolver:
                 structure == "scene"
                 and prop == "duration"
             ):
-
-                #
-                # Global scene dependency.
-                #
-                #
-                # It is not necessarily the same editorial
-                # scene, so do not automatically claim that it
-                # depends on this editorial scene.
-                #
 
                 return False
 
@@ -1179,7 +1119,7 @@ class TimelineResolver:
         structure, selector, prop = tokens
 
         #
-        # Direct editorial-scene dependency.
+        # Direct editorial scene dependency.
         #
 
         if (
@@ -1195,7 +1135,7 @@ class TimelineResolver:
             return True
 
         #
-        # Reference to another editorial scene.
+        # Another editorial scene.
         #
 
         if (
@@ -1208,11 +1148,6 @@ class TimelineResolver:
                     selector
                 ]
             )
-
-            #
-            # If the target scene has clips whose timing
-            # depends on our scene, propagate that dependency.
-            #
 
             for clip_obj in target_scene.clips:
 
@@ -1318,31 +1253,7 @@ class TimelineResolver:
 
     # ========================================================
     #
-    # DEFAULT DURATION
-    #
-    # ========================================================
-
-
-
-    def _default_duration_ms(
-        self,
-        clip_id
-    ):
-
-        if self.duration_provider is not None:
-            return int(
-                self.duration_provider(
-                    clip_id
-                )
-            )
-
-        raise TimelineResolutionError(
-            f"No duration provider available for clip '{clip_id}'."
-        )
-
-    # ========================================================
-    #
-    # SCENE PERCENTAGE ANALYSIS
+    # SCENE ANALYSIS
     #
     # ========================================================
 
@@ -1392,41 +1303,12 @@ class TimelineResolver:
 
         return False
 
-    def _default_duration_value(
-        self,
-        clip_id
-    ):
-        """
-        Obtain the actual duration of a clip.
-
-        If the timeline contains no explicit JSON duration for a clip,
-        TimelineResolver defers obtaining the concrete duration until
-        the VSEBuilder creates the actual Blender strip. To support
-        that deferred resolution this method returns a descriptor that
-        indicates the duration should be taken from the created strip.
-
-        The returned value is a mapping with a "type" key. For
-        deferred resolution the mapping is: {"type": "from_strip", "clip_id": ...}.
-        """
-
-        # Signal deferred resolution: VSEBuilder should read the
-        # actual Blender strip's frame_final_duration for this clip.
-        return {
-            "type": "from_strip",
-            "clip_id": clip_id
-        }
-
     # --------------------------------------------------------
 
     def _scene_has_absolute_duration(
         self,
         scene_id
     ):
-        """
-        Determine whether an editorial scene contains at least
-        one duration value that is not percentage-dependent on
-        the same scene.
-        """
 
         scene = self.editorial_scenes.get(
             scene_id
@@ -1465,15 +1347,6 @@ class TimelineResolver:
         self,
         scene_id
     ):
-        """
-        Produce the initial value used by the percentage solver.
-
-        We deliberately inspect ALL clips rather than requiring an
-        anchor clip to appear before the percentage clips.
-
-        The position of an absolute-duration clip can itself depend
-        on percentage clips.
-        """
 
         scene = self.editorial_scenes.get(
             scene_id
@@ -1487,10 +1360,6 @@ class TimelineResolver:
             )
 
         seed = 0
-
-        #
-        # First collect absolute durations.
-        #
 
         for clip_obj in scene.clips:
 
@@ -1514,15 +1383,12 @@ class TimelineResolver:
 
                 continue
 
-            #
-            # We intentionally avoid resolving references here.
-            # The actual fixed-point pass will do that.
-            #
-
             try:
 
-                duration = self._resolve_absolute_timing_only(
-                    duration_value
+                duration = (
+                    self._resolve_absolute_timing_only(
+                        duration_value
+                    )
                 )
 
             except TimelineResolutionError:
@@ -1533,11 +1399,6 @@ class TimelineResolver:
                 seed,
                 abs(int(duration))
             )
-
-        #
-        # If no absolute duration exists, inspect explicit
-        # absolute starts.
-        #
 
         for clip_obj in scene.clips:
 
@@ -1563,8 +1424,10 @@ class TimelineResolver:
 
             try:
 
-                start = self._resolve_absolute_timing_only(
-                    start_value
+                start = (
+                    self._resolve_absolute_timing_only(
+                        start_value
+                    )
                 )
 
             except TimelineResolutionError:
@@ -1575,14 +1438,6 @@ class TimelineResolver:
                 seed,
                 abs(int(start))
             )
-
-        #
-        # There is no requirement that a scene contain an
-        # explicit absolute duration.
-        #
-        # The deterministic fallback exists only for an
-        # underdetermined percentage-only system.
-        #
 
         return max(
             seed,
@@ -1595,14 +1450,6 @@ class TimelineResolver:
         self,
         value
     ):
-        """
-        Resolve only intrinsically absolute timing values.
-
-        This helper is deliberately conservative and is used only
-        to produce an initial estimate.
-
-        The actual resolver remains responsible for references.
-        """
 
         if isinstance(
             value,
@@ -1652,23 +1499,6 @@ class TimelineResolver:
         self,
         scene_id
     ):
-        """
-        Invalidate clips for another percentage iteration.
-
-        IMPORTANT:
-
-        The percentage basis itself is NOT cleared here.
-
-        The whole point of this pass is:
-
-            basis
-                ->
-            resolve clips
-                ->
-            calculate new duration
-                ->
-            next basis
-        """
 
         scene = self.editorial_scenes.get(
             scene_id
@@ -1683,18 +1513,18 @@ class TimelineResolver:
             clip_obj.end = 0
             clip_obj.duration = 0
 
+            clip_obj.local_start = 0
+            clip_obj.local_end = 0
+            clip_obj.local_duration = 0
+
             clip_obj.resolved = False
             clip_obj.resolving = False
 
-        scene.start = 0
-        scene.end = 0
-        scene.duration = 0
+        scene.local_start = 0
+        scene.local_end = 0
+        scene.local_duration = 0
 
-        #
-        # Do NOT change scene.resolving here.
-        #
-        # The percentage solver owns that state.
-        #
+        scene.resolved = False
 
         track_ids = {
             clip_obj.track_id
@@ -1720,6 +1550,87 @@ class TimelineResolver:
 
     # ========================================================
     #
+    # SCENE POSITIONING
+    # ========================================================
+
+    def _editorial_scene_offset_ms(
+        self,
+        scene_id
+    ):
+        """
+        Return the absolute timeline position of an editorial
+        scene.
+
+        Scene order is authoritative.
+
+        Example at 24fps:
+
+            Scene 1:
+                start = frame 1
+
+            Scene 2:
+                start = Scene 1 end + 1 frame
+
+            Scene 3:
+                start = Scene 2 end + 1 frame
+
+        This is intentionally separate from the scene's local
+        duration calculation.
+        """
+
+        try:
+
+            index = (
+                self.editorial_scene_order.index(
+                    scene_id
+                )
+            )
+
+        except ValueError:
+
+            raise TimelineResolutionError(
+                f"Editorial scene '{scene_id}' "
+                f"is not registered."
+            )
+
+        position_ms = (
+            self.timeline_start_ms()
+        )
+
+        for previous_scene_id in (
+            self.editorial_scene_order[
+                :index
+            ]
+        ):
+
+            previous_scene = (
+                self.editorial_scenes[
+                    previous_scene_id
+                ]
+            )
+
+            #
+            # Ensure previous scene has been solved.
+            #
+
+            self.compute_editorial_scene(
+                previous_scene_id
+            )
+
+            position_ms += (
+                previous_scene.duration
+            )
+
+            position_ms += (
+                self.scene_gap_ms()
+            )
+
+        return int(
+            position_ms
+        )
+
+    # ========================================================
+    #
     # PERCENTAGE BASIS
     #
     # ========================================================
@@ -1728,39 +1639,6 @@ class TimelineResolver:
         self,
         scene_id
     ):
-        """
-        Resolve the duration of an editorial scene that is being
-        used as a percentage basis.
-
-        This is the central mechanism of the resolver.
-
-        Example:
-
-            A.start = 5% of scene
-            A.duration = 10% of scene
-
-            B.start = A.end
-            B.duration = 120000
-
-        Let D be the scene duration.
-
-            A.start    = 0.05D
-            A.duration = 0.10D
-            A.end      = 0.15D
-
-            B.start    = 0.15D
-            B.end      = 0.15D + 120000
-
-        Therefore:
-
-            D = 0.15D + 120000
-
-        The resolver discovers D automatically.
-        """
-
-        #
-        # Already solved.
-        #
 
         if scene_id in self.percentage_bases:
 
@@ -1781,10 +1659,6 @@ class TimelineResolver:
                 f"'{scene_id}'"
             )
 
-        #
-        # Prevent recursive percentage solving.
-        #
-
         if scene.percentage_resolving:
 
             basis = self.percentage_bases.get(
@@ -1797,23 +1671,19 @@ class TimelineResolver:
                     basis
                 )
 
-            #
-            # We are inside a recursive request before a basis
-            # has been established.
-            #
-            # Give the current solve a deterministic provisional
-            # basis rather than throwing immediately.
-            #
-
             basis = self._scene_initial_basis(
                 scene_id
             )
 
             self.percentage_bases[
                 scene_id
-            ] = int(basis)
+            ] = int(
+                basis
+            )
 
-            return int(basis)
+            return int(
+                basis
+            )
 
         scene.percentage_resolving = True
 
@@ -1827,61 +1697,32 @@ class TimelineResolver:
 
         try:
 
-            #
-            # Start with an estimate.
-            #
-
             basis = self._scene_initial_basis(
                 scene_id
             )
 
-            #
-            # Store it BEFORE resolving clips.
-            #
-            # This is crucial.
-            #
-
             self.percentage_bases[
                 scene_id
-            ] = int(basis)
+            ] = int(
+                basis
+            )
 
             converged = False
-
             last_duration = None
-
-            #
-            # ------------------------------------------------
-            # FIXED-POINT SOLVER
-            # ------------------------------------------------
-            #
 
             for _ in range(
                 PERCENTAGE_MAX_ITERATIONS
             ):
 
-                #
-                # The current basis is authoritative during
-                # this pass.
-                #
-
                 self.percentage_bases[
                     scene_id
-                ] = int(basis)
-
-                #
-                # Re-resolve every clip from scratch.
-                #
+                ] = int(
+                    basis
+                )
 
                 self._invalidate_editorial_scene_clips(
                     scene_id
                 )
-
-                #
-                # Resolve clips in editorial order.
-                #
-                # References may cause dependency-driven
-                # resolution recursively.
-                #
 
                 for clip_obj in scene.clips:
 
@@ -1890,7 +1731,11 @@ class TimelineResolver:
                     )
 
                 #
-                # Calculate the actual editorial scene bounds.
+                # IMPORTANT:
+                #
+                # We calculate duration using LOCAL clip
+                # coordinates here, not absolute timeline
+                # coordinates.
                 #
 
                 if not scene.clips:
@@ -1902,12 +1747,12 @@ class TimelineResolver:
                 else:
 
                     actual_start = min(
-                        clip.start
+                        clip.local_start
                         for clip in scene.clips
                     )
 
                     actual_end = max(
-                        clip.end
+                        clip.local_end
                         for clip in scene.clips
                     )
 
@@ -1917,12 +1762,16 @@ class TimelineResolver:
                         actual_start
                     )
 
-                scene.start = int(
+                scene.local_start = int(
                     actual_start
                 )
 
-                scene.end = int(
+                scene.local_end = int(
                     actual_end
+                )
+
+                scene.local_duration = int(
+                    actual_duration
                 )
 
                 scene.duration = int(
@@ -1932,10 +1781,6 @@ class TimelineResolver:
                 last_duration = (
                     actual_duration
                 )
-
-                #
-                # Convergence.
-                #
 
                 if abs(
                     actual_duration -
@@ -1950,31 +1795,12 @@ class TimelineResolver:
 
                     break
 
-                #
-                # Continue from the new duration.
-                #
-
                 basis = int(
                     actual_duration
                 )
 
-                #
-                # A zero duration is a valid mathematical
-                # fixed point but not useful as a timeline.
-                #
-                # If we have reached zero, we need to determine
-                # whether the scene is genuinely underdetermined.
-                #
-
                 if basis <= 0:
-
                     break
-
-            #
-            # ------------------------------------------------
-            # ZERO-DURATION / UNDERDETERMINED CASE
-            # ------------------------------------------------
-            #
 
             if (
                 not converged
@@ -1984,16 +1810,6 @@ class TimelineResolver:
                 )
             ):
 
-                #
-                # Pure percentage systems are scale-free.
-                #
-                # They cannot mathematically determine their
-                # own absolute duration.
-                #
-                # We therefore use the deterministic fallback
-                # rather than throwing an exception.
-                #
-
                 basis = max(
                     UNDERDETERMINED_SCENE_DURATION_MS,
                     int(basis or 0)
@@ -2002,10 +1818,6 @@ class TimelineResolver:
                 self.percentage_bases[
                     scene_id
                 ] = basis
-
-                #
-                # Resolve once more using the fallback.
-                #
 
                 self._invalidate_editorial_scene_clips(
                     scene_id
@@ -2019,32 +1831,31 @@ class TimelineResolver:
 
                 if scene.clips:
 
-                    scene.start = min(
-                        clip.start
+                    scene.local_start = min(
+                        clip.local_start
                         for clip in scene.clips
                     )
 
-                    scene.end = max(
-                        clip.end
+                    scene.local_end = max(
+                        clip.local_end
                         for clip in scene.clips
                     )
 
-                    scene.duration = max(
+                    scene.local_duration = max(
                         0,
-                        scene.end -
-                        scene.start
+                        scene.local_end -
+                        scene.local_start
                     )
 
                 else:
 
-                    scene.start = 0
-                    scene.end = 0
-                    scene.duration = 0
+                    scene.local_start = 0
+                    scene.local_end = 0
+                    scene.local_duration = 0
 
-                #
-                # If the fallback still produces zero, retain
-                # the fallback as the authoritative basis.
-                #
+                scene.duration = (
+                    scene.local_duration
+                )
 
                 if scene.duration <= 0:
 
@@ -2052,8 +1863,8 @@ class TimelineResolver:
                         UNDERDETERMINED_SCENE_DURATION_MS
                     )
 
-                    scene.end = (
-                        scene.start +
+                    scene.local_end = (
+                        scene.local_start +
                         scene.duration
                     )
 
@@ -2067,40 +1878,23 @@ class TimelineResolver:
                     scene.duration
                 )
 
-            #
-            # ------------------------------------------------
-            # NON-CONVERGENCE
-            # ------------------------------------------------
-            #
-
             if not converged:
 
                 raise TimelinePercentageResolutionError(
-                    f"Could not converge percentage timing "
-                    f"for editorial scene '{scene_id}' "
-                    f"after {PERCENTAGE_MAX_ITERATIONS} "
+                    f"Could not converge percentage "
+                    f"timing for editorial scene "
+                    f"'{scene_id}' after "
+                    f"{PERCENTAGE_MAX_ITERATIONS} "
                     f"iterations. "
-                    f"The timing dependency graph may be "
-                    f"unstable or may consume 100% or more "
-                    f"of the scene. "
                     f"Last duration: "
                     f"{last_duration} ms."
                 )
-
-            #
-            # Final authoritative basis.
-            #
 
             self.percentage_bases[
                 scene_id
             ] = int(
                 basis
             )
-
-            #
-            # The final clips were already resolved against
-            # this converged basis.
-            #
 
             return int(
                 basis
@@ -2124,9 +1918,6 @@ class TimelineResolver:
         self,
         scene_id
     ):
-        """
-        Resolve every clip belonging to an editorial scene.
-        """
 
         scene = self.editorial_scenes.get(
             scene_id
@@ -2144,11 +1935,6 @@ class TimelineResolver:
 
         if scene.resolving:
 
-            #
-            # During percentage solving, the provisional basis
-            # is enough.
-            #
-
             if scene_id in self.percentage_bases:
                 return
 
@@ -2161,19 +1947,56 @@ class TimelineResolver:
 
         try:
 
+            #
+            # Resolve all previous scenes first.
+            #
+            # This guarantees that Scene 2 can never resolve
+            # itself at frame 0 while Scene 1 exists.
+            #
+
+            index = (
+                self.editorial_scene_order.index(
+                    scene_id
+                )
+            )
+
+            for previous_scene_id in (
+                self.editorial_scene_order[
+                    :index
+                ]
+            ):
+
+                self.compute_editorial_scene(
+                    previous_scene_id
+                )
+
+            #
+            # Empty scene.
+            #
+
             if not scene.clips:
 
-                scene.start = 0
-                scene.end = 0
+                scene.local_start = 0
+                scene.local_end = 0
+                scene.local_duration = 0
+
+                scene.start = (
+                    self._editorial_scene_offset_ms(
+                        scene_id
+                    )
+                )
+
                 scene.duration = 0
+
+                scene.end = scene.start
 
                 scene.resolved = True
 
                 return
 
             #
-            # Does this scene use its own duration as a
-            # percentage basis?
+            # Determine whether this scene has a percentage
+            # dependency.
             #
 
             has_percentage_dependency = (
@@ -2197,27 +2020,46 @@ class TimelineResolver:
                     )
 
             #
-            # Final bounds.
+            # Calculate LOCAL bounds.
             #
 
-            scene.start = min(
-                clip.start
+            scene.local_start = min(
+                clip.local_start
                 for clip in scene.clips
             )
 
-            scene.end = max(
-                clip.end
+            scene.local_end = max(
+                clip.local_end
                 for clip in scene.clips
             )
 
-            scene.duration = max(
+            scene.local_duration = max(
                 0,
-                scene.end -
-                scene.start
+                scene.local_end -
+                scene.local_start
+            )
+
+            scene.duration = (
+                scene.local_duration
             )
 
             #
-            # Percentage basis becomes authoritative.
+            # Absolute scene position.
+            #
+
+            scene.start = (
+                self._editorial_scene_offset_ms(
+                    scene_id
+                )
+            )
+
+            scene.end = (
+                scene.start +
+                scene.duration
+            )
+
+            #
+            # Percentage basis remains LOCAL duration.
             #
 
             if has_percentage_dependency:
@@ -2244,9 +2086,6 @@ class TimelineResolver:
         self,
         clip_id
     ):
-        """
-        Resolve one clip.
-        """
 
         obj = self.clips.get(
             clip_id
@@ -2289,6 +2128,34 @@ class TimelineResolver:
                 )
 
             #
+            # Determine the editorial scene.
+            #
+
+            editorial_scene_id = (
+                clip.get(
+                    "editorial_scene"
+                )
+            )
+
+            editorial_scene = None
+
+            if editorial_scene_id:
+
+                editorial_scene = (
+                    self.editorial_scenes.get(
+                        editorial_scene_id
+                    )
+                )
+
+                if editorial_scene is None:
+
+                    raise TimelineResolutionError(
+                        f"Unknown editorial scene "
+                        f"'{editorial_scene_id}' "
+                        f"for clip '{clip_id}'."
+                    )
+
+            #
             # Start.
             #
 
@@ -2298,8 +2165,58 @@ class TimelineResolver:
                     f"Clip '{clip_id}' has no 'start'."
                 )
 
-            start = self.resolve_ms(
-                clip["start"],
+            start_value = clip["start"]
+
+            #
+            # FIX: "reference" and "expression" timing values
+            # resolve through resolve_reference()/resolve_expression(),
+            # which always return an ABSOLUTE timeline position -
+            # every clip/scene "start"/"end"/"center" this resolver
+            # produces (obj.start below, scene.start above) is
+            # absolute, never scene-relative.
+            #
+            # The old code treated the resolved value of clip["start"]
+            # as always being LOCAL (scene-relative) and unconditionally
+            # added the scene's absolute offset on top of it:
+            #
+            #     obj.start = scene_offset + obj.local_start
+            #
+            # That is only correct when clip["start"] is a genuinely
+            # local value (bare milliseconds/seconds, or a percentage
+            # of the scene). For a clip whose "start" is
+            # {"type": "reference", "value": "clip:X:end"} or
+            # {"type": "reference", "value": "scene:X:start"} - which
+            # is the overwhelming majority of real editorial data -
+            # the resolved value is ALREADY absolute, so adding the
+            # scene offset again double-counted it. The effect
+            # compounds with every "clip:X:end" hop down a chain,
+            # which is why later scenes/clips drift further and
+            # further from their intended position while the very
+            # first scene (whose offset is only ~1 frame) looked
+            # almost right.
+            #
+            # Fix: only add the scene offset for genuinely local
+            # timing types. Reference/expression results are used
+            # as the absolute start directly, and local_start is
+            # derived FROM that (for the percentage solver, which
+            # still needs true local/scene-relative coordinates).
+            #
+
+            start_timing_type = (
+                start_value.get("type")
+                if isinstance(start_value, dict)
+                else None
+            )
+
+            start_is_absolute = (
+                start_timing_type in (
+                    "reference",
+                    "expression",
+                )
+            )
+
+            resolved_start = self.resolve_ms(
+                start_value,
                 clip_id=clip_id
             )
 
@@ -2330,11 +2247,57 @@ class TimelineResolver:
                 )
 
             #
-            # Store.
+            # Scene offset (or timeline start for scene-less clips).
             #
 
-            obj.start = int(
-                start
+            if editorial_scene is not None:
+
+                scene_offset = (
+                    self._editorial_scene_offset_ms(
+                        editorial_scene_id
+                    )
+                )
+
+            else:
+
+                scene_offset = (
+                    self.timeline_start_ms()
+                )
+
+            #
+            # Absolute + local values.
+            #
+
+            if start_is_absolute:
+
+                obj.start = int(
+                    resolved_start
+                )
+
+                obj.local_start = max(
+                    0,
+                    obj.start -
+                    scene_offset
+                )
+
+            else:
+
+                obj.local_start = int(
+                    resolved_start
+                )
+
+                obj.start = (
+                    scene_offset +
+                    obj.local_start
+                )
+
+            obj.local_duration = int(
+                duration
+            )
+
+            obj.local_end = (
+                obj.local_start +
+                obj.local_duration
             )
 
             obj.duration = int(
@@ -2461,10 +2424,16 @@ class TimelineResolver:
 
         try:
 
-            self.scene.start = 0
+            #
+            # The global scene begins at frame 1.
+            #
+
+            self.scene.start = (
+                self.timeline_start_ms()
+            )
 
             #
-            # Resolve all editorial scenes first.
+            # Resolve editorial scenes sequentially.
             #
 
             for scene_id in (
@@ -2476,7 +2445,7 @@ class TimelineResolver:
                 )
 
             #
-            # Resolve all clips.
+            # Resolve remaining clips.
             #
 
             for clip_id in self.clip_order:
@@ -2487,7 +2456,10 @@ class TimelineResolver:
 
             if not self.clips:
 
-                self.scene.end = 0
+                self.scene.end = (
+                    self.scene.start
+                )
+
                 self.scene.duration = 0
 
             else:
@@ -2497,7 +2469,8 @@ class TimelineResolver:
                     for clip in self.clips.values()
                 )
 
-                self.scene.duration = (
+                self.scene.duration = max(
+                    0,
                     self.scene.end -
                     self.scene.start
                 )
@@ -2519,33 +2492,6 @@ class TimelineResolver:
         ref,
         clip_id=None
     ):
-        """
-        Resolve:
-
-            scene:start
-
-            scene:end
-
-            scene:duration
-
-            scene:edscene-001:start
-
-            scene:edscene-001:end
-
-            scene:edscene-001:duration
-
-            track:track-id:start
-
-            track:track-id:end
-
-            track:track-id:duration
-
-            clip:clip-id:start
-
-            clip:clip-id:end
-
-            clip:clip-id:duration
-        """
 
         if not isinstance(
             ref,
@@ -2559,12 +2505,6 @@ class TimelineResolver:
 
         tokens = ref.split(":")
 
-        # ----------------------------------------------------
-        # Global scene
-        #
-        # scene:start
-        # ----------------------------------------------------
-
         if len(tokens) == 2:
 
             structure, prop = tokens
@@ -2577,14 +2517,6 @@ class TimelineResolver:
                 )
 
             selector = None
-
-        # ----------------------------------------------------
-        # Explicit object
-        #
-        # scene:id:start
-        # clip:id:start
-        # track:id:start
-        # ----------------------------------------------------
 
         elif len(tokens) == 3:
 
@@ -2609,10 +2541,6 @@ class TimelineResolver:
 
         if structure == "scene":
 
-            #
-            # scene:start
-            #
-
             if selector is None:
 
                 if prop in (
@@ -2631,10 +2559,6 @@ class TimelineResolver:
                     prop
                 )
 
-            #
-            # Editorial scene.
-            #
-
             target_scene = (
                 self.editorial_scenes.get(
                     selector
@@ -2649,8 +2573,8 @@ class TimelineResolver:
                 )
 
             #
-            # During a percentage solve, the basis is the
-            # authoritative duration.
+            # During percentage solving the duration is the
+            # provisional LOCAL basis.
             #
 
             if (
@@ -2664,33 +2588,37 @@ class TimelineResolver:
                     ]
                 )
 
+                #
+                # Scene start is still an ABSOLUTE position.
+                #
+
+                scene_start = (
+                    self._editorial_scene_offset_ms(
+                        selector
+                    )
+                )
+
                 if prop == "duration":
+
                     return basis
 
                 if prop == "start":
 
-                    return int(
-                        target_scene.start
-                    )
+                    return scene_start
 
                 if prop == "end":
 
                     return (
-                        int(
-                            target_scene.start
-                        ) +
+                        scene_start +
                         basis
                     )
 
                 if prop == "center":
 
                     return (
-                        int(
-                            target_scene.start
-                        ) +
+                        scene_start +
                         (
-                            basis //
-                            2
+                            basis // 2
                         )
                     )
 
@@ -2894,15 +2822,6 @@ class TimelineResolver:
         expression,
         clip_id=None
     ):
-        """
-        Resolve expressions such as:
-
-            clip:clip-001:end + 500
-
-            scene:edscene-001:start + 2000
-
-            clip:first:end - clip:first:start
-        """
 
         if not isinstance(
             expression,
@@ -2948,24 +2867,6 @@ class TimelineResolver:
         self,
         expression
     ):
-        """
-        Evaluate arithmetic expressions without exposing
-        Python's eval environment.
-
-        Supported:
-
-            +
-            -
-            *
-            /
-            //
-            %
-            **
-            unary +
-            unary -
-
-        Result is always an integer.
-        """
 
         try:
 
@@ -3112,19 +3013,23 @@ class TimelineResolver:
     ):
 
         #
-        # Global scene
+        # Global scene.
         #
 
         self.scene.start = 0
         self.scene.end = 0
         self.scene.duration = 0
 
+        self.scene.local_start = 0
+        self.scene.local_end = 0
+        self.scene.local_duration = 0
+
         self.scene.resolved = False
         self.scene.resolving = False
         self.scene.percentage_resolving = False
 
         #
-        # Tracks
+        # Tracks.
         #
 
         for track in self.tracks.values():
@@ -3133,12 +3038,16 @@ class TimelineResolver:
             track.end = 0
             track.duration = 0
 
+            track.local_start = 0
+            track.local_end = 0
+            track.local_duration = 0
+
             track.resolved = False
             track.resolving = False
             track.percentage_resolving = False
 
         #
-        # Clips
+        # Clips.
         #
 
         for clip in self.clips.values():
@@ -3147,12 +3056,16 @@ class TimelineResolver:
             clip.end = 0
             clip.duration = 0
 
+            clip.local_start = 0
+            clip.local_end = 0
+            clip.local_duration = 0
+
             clip.resolved = False
             clip.resolving = False
             clip.percentage_resolving = False
 
         #
-        # Editorial scenes
+        # Editorial scenes.
         #
 
         for scene in self.editorial_scenes.values():
@@ -3160,6 +3073,10 @@ class TimelineResolver:
             scene.start = 0
             scene.end = 0
             scene.duration = 0
+
+            scene.local_start = 0
+            scene.local_end = 0
+            scene.local_duration = 0
 
             scene.resolved = False
             scene.resolving = False
@@ -3193,12 +3110,21 @@ class TimelineResolver:
 
         Resolution order:
 
-            1. Editorial scene percentage systems
+            1. Editorial scenes sequentially
             2. Individual clips
             3. Tracks
             4. Global scene
 
-        No explicit editorial-scene duration is required.
+        Editorial scene starts are absolute and sequential.
+
+        Clip starts inside editorial scenes are scene-relative
+        UNLESS the "start" timing itself is a reference or
+        expression, in which case it is already absolute (see
+        the fix note in compute_clip).
+
+        The first scene begins at frame 1.
+
+        Every subsequent scene receives a one-frame gap.
         """
 
         self.reset()
@@ -3207,6 +3133,8 @@ class TimelineResolver:
         # PASS 1
         #
         # Editorial scenes.
+        #
+        # Sequential resolution is important.
         # ----------------------------------------------------
 
         self.phase = (
