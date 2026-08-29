@@ -1,11 +1,11 @@
 import bpy
 from .panel_main import VSE_INSTRUCTOR_PT_MainPanel, VSEInstructorProperties
 from .panel_server import VSE_INSTRUCTOR_PT_ServerPanel, VSEInstructorServerProperties, VSEServerLogLine
-from .panel_logs import VSE_INSTRUCTOR_PT_Logs
-
+from .panel_logs import VSE_INSTRUCTOR_PT_Logs, VSE_INSTRUCTOR_UL_Logs
 
 classes = [
     VSEServerLogLine,
+    VSE_INSTRUCTOR_UL_Logs,
     VSE_INSTRUCTOR_PT_MainPanel,
     VSE_INSTRUCTOR_PT_ServerPanel,
     VSEInstructorProperties,

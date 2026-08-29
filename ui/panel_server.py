@@ -1,7 +1,7 @@
 import bpy
 from bpy.types import Panel
 from bpy.types import PropertyGroup
-from bpy.props import StringProperty, CollectionProperty
+from bpy.props import StringProperty, CollectionProperty, IntProperty
 
 
 def connection_status_update(self, context):
@@ -39,6 +39,8 @@ class VSEInstructorServerProperties(PropertyGroup):
     )
 
     logs: CollectionProperty(type=VSEServerLogLine)
+
+    log_index: IntProperty(default=0)
 
 
 class VSE_INSTRUCTOR_PT_ServerPanel(bpy.types.Panel):

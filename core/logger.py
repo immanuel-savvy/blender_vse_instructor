@@ -17,8 +17,12 @@ class Logger:
         item.text = line
 
         # keep log size sane
-        if len(props.logs) > 200:
+        if len(props.logs) > 500:
             props.logs.remove(0)
+
+        # keep the (future) UIList scrolled to the newest entry
+        if hasattr(props, "log_index"):
+            props.log_index = len(props.logs) - 1
 
         # also update "Last Message"
         props.last_message = line

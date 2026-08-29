@@ -3,7 +3,6 @@ import bpy
 from ..core.logger import Logger
 
 from pathlib import Path
-
 from datetime import datetime, timezone
 
 import urllib.request
@@ -11,6 +10,7 @@ import json
 import base64
 import math
 import uuid
+import re
 
 from .timeline_resolver import (
     TimelineResolver,
@@ -30,6 +30,7 @@ CACHE_ROOT.mkdir(
     parents=True,
     exist_ok=True,
 )
+
 
 MEDIA_EXTENSIONS = {
     "video": [
@@ -58,50 +59,60 @@ MEDIA_EXTENSIONS = {
 
 
 # =============================================================================
+# LOCAL STATICS
+# =============================================================================
+
+LOCAL_AUDIO_STATICS = Path(
+    "/Users/mac/Creature/web4/SERVICES/Social_handler/statics/audio"
+)
+
+
+# =============================================================================
 # CHANNEL LAYOUT
 # =============================================================================
 
+ROLE_WEIGHT = {
+    "metadata": 0,
+    "music": 10,
+    "sfx": 20,
+    "audio": 30,
+    "video-main": 40,
+    "video-overlay": 50,
+    "transform": 55,
+    "text": 90,
+}
+
+
+ROLE_PREFERRED_START = {
+    "music": 1,
+    "sfx": 2,
+    "audio": 3,
+    "video-main": 4,
+    "video-overlay": 6,
+    "transform": 8,
+    "text": 10,
+}
+
+
+MAX_PERMANENT_CHANNEL = 20
+PROBE_CHANNEL = MAX_PERMANENT_CHANNEL + 1
+
+
 TRACK_TYPE_ROLES = {
     "primary_visual": "video-main",
-
     "dialogue": "audio",
     "voiceover": "audio",
-
     "secondary_visual": "video-overlay",
     "overlay": "video-overlay",
     "graphics": "video-overlay",
-
     "subtitle": "text",
     "title": "text",
-
     "sfx": "sfx",
-
     "ambience": "music",
     "music": "music",
-
+    "transform": "transform",
     "metadata": None,
 }
-
-
-ROLE_CHANNELS = {
-    "video-main": (1, 2),
-    "audio": (3, 3),
-    "video-overlay": (4, 5),
-    "text": (6, 6),
-    "sfx": (7, 7),
-    "music": (8, 8),
-}
-
-
-# The probe channel must never overlap any permanent channel.
-PROBE_CHANNEL = (
-    max(
-        channel
-        for channels in ROLE_CHANNELS.values()
-        for channel in channels
-    )
-    + 1
-)
 
 
 # =============================================================================
@@ -111,6 +122,379 @@ PROBE_CHANNEL = (
 DEFAULT_IMAGE_DURATION_SECONDS = 5.0
 DEFAULT_UNRESOLVED_DURATION_SECONDS = 5.0
 
+
+# =============================================================================
+# INTERPOLATION
+# =============================================================================
+
+INTERPOLATION_MAP = {
+    "linear": "LINEAR",
+    "constant": "CONSTANT",
+    "bezier": "BEZIER",
+}
+
+
+# =============================================================================
+# DYNAMIC CHANNEL ALLOCATOR
+# =============================================================================
+
+class ChannelAllocator:
+    """
+    Expanding-span allocator with real occupancy relocation.
+
+    Rule: when a role needs more channels it expands upward and
+    pushes EVERY higher role (and their already-placed strips)
+    further up. The new span is stored permanently for that role.
+    """
+
+    def __init__(self, max_channel=MAX_PERMANENT_CHANNEL):
+
+        self.max_channel = max_channel
+
+        # role -> (low, high)
+        self.spans = {}
+
+        # channel -> list of (start_frame, end_frame)
+        self.occupancy = {
+            c: []
+            for c in range(1, max_channel + 1)
+        }
+
+        self.preferred = {
+            "music": 1,
+            "sfx": 2,
+            "audio": 3,
+            "video-audio": 4,
+            "video-main": 5,
+            "video-overlay": 7,
+            "transform": 9,
+            "text": 10,
+        }
+
+        self.ordered_roles = sorted(
+            ROLE_WEIGHT.keys(),
+            key=lambda r: ROLE_WEIGHT.get(r, 0),
+        )
+
+    def _overlaps(self, channel, start, end):
+
+        for s, e in self.occupancy.get(channel, []):
+
+            if not (end <= s or start >= e):
+                return True
+
+        return False
+
+    def _get_span(self, role):
+
+        if role not in self.spans:
+
+            base = self.preferred.get(role, 5)
+
+            self.spans[role] = (
+                base,
+                base,
+            )
+
+        return self.spans[role]
+
+    def _set_span(self, role, low, high):
+
+        self.spans[role] = (
+            max(1, low),
+            min(high, self.max_channel),
+        )
+
+    def _find_free(self, low, high, start, end):
+
+        for ch in range(low, high + 1):
+
+            if ch > self.max_channel:
+                break
+
+            if not self._overlaps(
+                ch,
+                start,
+                end,
+            ):
+                return ch
+
+        return None
+
+    def _relocate_occupancy(self, from_ch, to_ch):
+
+        if from_ch == to_ch:
+            return
+
+        if from_ch not in self.occupancy:
+            return
+
+        intervals = self.occupancy[from_ch]
+
+        if not intervals:
+            return
+
+        self.occupancy.setdefault(
+            to_ch,
+            [],
+        ).extend(intervals)
+
+        self.occupancy[from_ch] = []
+
+    def _push_higher_roles(self, from_role, amount):
+
+        if amount <= 0:
+            return
+
+        my_w = ROLE_WEIGHT.get(
+            from_role,
+            0,
+        )
+
+        channels_to_move = sorted(
+            [
+                c
+                for c in self.occupancy
+                if c >= 1
+            ],
+            reverse=True,
+        )
+
+        for role in reversed(self.ordered_roles):
+
+            if ROLE_WEIGHT.get(role, 0) <= my_w:
+                continue
+
+            if role not in self.spans:
+                continue
+
+            old_lo, old_hi = self.spans[role]
+
+            new_lo = min(
+                old_lo + amount,
+                self.max_channel,
+            )
+
+            new_hi = min(
+                old_hi + amount,
+                self.max_channel,
+            )
+
+            self.spans[role] = (
+                new_lo,
+                new_hi,
+            )
+
+        for ch in channels_to_move:
+
+            owner = None
+
+            for r, (lo, hi) in self.spans.items():
+
+                if (
+                    lo <= ch <= hi
+                    and ROLE_WEIGHT.get(r, 0) > my_w
+                ):
+                    owner = r
+                    break
+
+            if owner is None:
+                continue
+
+            new_ch = min(
+                ch + amount,
+                self.max_channel,
+            )
+
+            if new_ch != ch:
+
+                self._relocate_occupancy(
+                    ch,
+                    new_ch,
+                )
+
+    def allocate(
+        self,
+        role,
+        start_frame,
+        end_frame,
+        prefer_pair=False,
+    ):
+
+        start = int(start_frame)
+        end = int(end_frame)
+
+        video_ch = None
+        audio_ch = None
+
+        if role in {
+            "video-main",
+            "video-overlay",
+            "text",
+            "transform",
+        }:
+
+            low, high = self._get_span(role)
+
+            video_ch = self._find_free(
+                low,
+                high,
+                start,
+                end,
+            )
+
+            if video_ch is None:
+
+                self._set_span(
+                    role,
+                    low,
+                    high + 1,
+                )
+
+                self._push_higher_roles(
+                    role,
+                    1,
+                )
+
+                low, high = self._get_span(role)
+
+                video_ch = self._find_free(
+                    low,
+                    high,
+                    start,
+                    end,
+                )
+
+            if video_ch is None:
+                video_ch = high
+
+            self.occupancy.setdefault(
+                video_ch,
+                [],
+            ).append(
+                (
+                    start,
+                    end,
+                )
+            )
+
+        if role in {
+            "audio",
+            "sfx",
+            "music",
+        }:
+
+            low, high = self._get_span(role)
+
+            audio_ch = self._find_free(
+                low,
+                high,
+                start,
+                end,
+            )
+
+            if audio_ch is None:
+
+                self._set_span(
+                    role,
+                    low,
+                    high + 1,
+                )
+
+                self._push_higher_roles(
+                    role,
+                    1,
+                )
+
+                low, high = self._get_span(role)
+
+                audio_ch = self._find_free(
+                    low,
+                    high,
+                    start,
+                    end,
+                )
+
+            if audio_ch is None:
+                audio_ch = low
+
+            self.occupancy.setdefault(
+                audio_ch,
+                [],
+            ).append(
+                (
+                    start,
+                    end,
+                )
+            )
+
+        elif prefer_pair and video_ch is not None:
+
+            pair_role = "video-audio"
+
+            if pair_role not in self.spans:
+
+                vlow, _ = self._get_span(role)
+
+                self.spans[pair_role] = (
+                    max(1, vlow - 1),
+                    max(1, vlow - 1),
+                )
+
+            low, high = self._get_span(
+                pair_role,
+            )
+
+            audio_ch = self._find_free(
+                low,
+                high,
+                start,
+                end,
+            )
+
+            if audio_ch is None:
+
+                self._set_span(
+                    pair_role,
+                    low,
+                    high + 1,
+                )
+
+                self._push_higher_roles(
+                    pair_role,
+                    1,
+                )
+
+                low, high = self._get_span(
+                    pair_role,
+                )
+
+                audio_ch = self._find_free(
+                    low,
+                    high,
+                    start,
+                    end,
+                )
+
+            if audio_ch is None:
+                audio_ch = low
+
+            self.occupancy.setdefault(
+                audio_ch,
+                [],
+            ).append(
+                (
+                    start,
+                    end,
+                )
+            )
+
+        return video_ch, audio_ch
+
+
+# =============================================================================
+# VSE BUILDER
+# =============================================================================
 
 class VSEBuilder(Vse_renderer):
 
@@ -167,33 +551,11 @@ class VSEBuilder(Vse_renderer):
 
         self._compiled_strips = self.strips
 
-        # ---------------------------------------------------------------------
-        # clip_id -> native duration in frames
-        # ---------------------------------------------------------------------
-
         self._native_durations = {}
-
-        # ---------------------------------------------------------------------
-        # clip_id -> original clip object
-        #
-        # This is critical.
-        #
-        # TimelineResolver only gives us the clip id when requesting a
-        # duration. We therefore need an index allowing us to lazily probe
-        # that clip if Pass 2 did not already populate its duration.
-        # ---------------------------------------------------------------------
 
         self._clips_by_id = {}
 
-        # ---------------------------------------------------------------------
-        # clip_id -> track
-        # ---------------------------------------------------------------------
-
         self._clip_tracks = {}
-
-        # ---------------------------------------------------------------------
-        # Prevent repeated failed probing.
-        # ---------------------------------------------------------------------
 
         self._probe_failures = set()
 
@@ -202,6 +564,13 @@ class VSEBuilder(Vse_renderer):
         self._image_counter = 0
         self._text_counter = 0
         self._probe_counter = 0
+        self._effect_counter = 0
+
+        self._transform_effects = {}
+
+        self.channel_allocator = (
+            ChannelAllocator()
+        )
 
         if self.sequencer is None:
 
@@ -247,6 +616,12 @@ class VSEBuilder(Vse_renderer):
 
         return f"TXT{self._text_counter:03d}"
 
+    def _next_effect_name(self):
+
+        self._effect_counter += 1
+
+        return f"FX{self._effect_counter:03d}"
+
     def _next_probe_name(self):
 
         self._probe_counter += 1
@@ -260,8 +635,7 @@ class VSEBuilder(Vse_renderer):
     def set_generation(self, generation):
 
         self.log.info(
-            f"Setting new generation "
-            f"{generation.get('_id')}"
+            f"Setting new generation {generation.get('_id')}"
         )
 
         self.generation = generation
@@ -287,7 +661,7 @@ class VSEBuilder(Vse_renderer):
             url=f"{self.editor_url}/read_upload",
             data=payload,
             headers={
-                "Content-Type": "application/json",
+                "Content-Type": "application/json"
             },
             method="POST",
         )
@@ -301,10 +675,7 @@ class VSEBuilder(Vse_renderer):
                 res.read().decode("utf-8")
             )
 
-    def _infer_extension(
-        self,
-        clip_ref,
-    ):
+    def _infer_extension(self, clip_ref):
 
         mime = clip_ref.get("mime")
         title = clip_ref.get("title")
@@ -313,11 +684,9 @@ class VSEBuilder(Vse_renderer):
             "image/jpeg": ".jpg",
             "image/png": ".png",
             "image/webp": ".webp",
-
             "video/mp4": ".mp4",
             "video/quicktime": ".mov",
             "video/webm": ".webm",
-
             "audio/mpeg": ".mp3",
             "audio/wav": ".wav",
             "audio/x-wav": ".wav",
@@ -351,6 +720,50 @@ class VSEBuilder(Vse_renderer):
         return ".bin"
 
     # =========================================================================
+    # LOCAL AUDIO RESOLUTION
+    # =========================================================================
+
+    def _resolve_local_audio(self, clip_ref):
+
+        media_id = (
+            clip_ref.get("_id")
+            or clip_ref.get("clip_ref_id")
+            or clip_ref.get("source_asset_id")
+        )
+
+        if not media_id:
+            return None
+
+        candidates = [
+            LOCAL_AUDIO_STATICS / f"{media_id}.wav",
+            LOCAL_AUDIO_STATICS / f"{media_id}.mp3",
+            LOCAL_AUDIO_STATICS / f"{media_id}.flac",
+            LOCAL_AUDIO_STATICS / f"{media_id}.ogg",
+            LOCAL_AUDIO_STATICS / f"{media_id}.aac",
+        ]
+
+        for path in candidates:
+
+            if path.exists():
+
+                self.log.info(
+                    f"[LOCAL AUDIO] Resolved "
+                    f"{media_id} -> {path}"
+                )
+
+                return {
+                    "filepath": str(path),
+                    "media_type": "audio",
+                    "resolved": True,
+                    "clip_ref": {
+                        **clip_ref,
+                        "type": "audio",
+                    },
+                }
+
+        return None
+
+    # =========================================================================
     # MEDIA RESOLUTION
     # =========================================================================
 
@@ -368,7 +781,9 @@ class VSEBuilder(Vse_renderer):
             "audio",
             "text",
             "scene",
+            "transform",
         }:
+
             return False
 
         return (
@@ -377,20 +792,14 @@ class VSEBuilder(Vse_renderer):
             or "preferred_type" in clip_ref
         )
 
-    def _resolve_placeholder(
-        self,
-        clip_ref,
-    ):
+    def _resolve_placeholder(self, clip_ref):
 
         preferred = clip_ref.get(
             "preferred_type",
             "image",
         )
 
-        statics = (
-            CACHE_ROOT
-            / "statics"
-        )
+        statics = CACHE_ROOT / "statics"
 
         statics.mkdir(
             parents=True,
@@ -398,20 +807,12 @@ class VSEBuilder(Vse_renderer):
         )
 
         if preferred == "video":
-
-            return str(
-                statics / "video.mp4"
-            )
+            return str(statics / "video.mp4")
 
         if preferred == "audio":
+            return str(statics / "audio.wav")
 
-            return str(
-                statics / "audio.wav"
-            )
-
-        return str(
-            statics / "image.png"
-        )
+        return str(statics / "image.png")
 
     def _attach_strip_metadata(
         self,
@@ -421,18 +822,16 @@ class VSEBuilder(Vse_renderer):
         resolved,
     ):
 
-        strip["asset_id"] = (
-            clip_ref.get("_id")
-        )
+        strip["asset_id"] = clip_ref.get("_id")
 
-        strip["instance_id"] = (
-            clip.get("instanceId")
+        strip["instance_id"] = clip.get(
+            "instanceId"
         )
 
         strip["resolved"] = resolved
 
-        strip["preferred_type"] = (
-            clip_ref.get("preferred_type")
+        strip["preferred_type"] = clip_ref.get(
+            "preferred_type"
         )
 
         strip["accepted_types"] = json.dumps(
@@ -475,10 +874,7 @@ class VSEBuilder(Vse_renderer):
         except Exception:
             pass
 
-    def _find_cached_media(
-        self,
-        clip_ref,
-    ):
+    def _find_cached_media(self, clip_ref):
 
         media_id = clip_ref.get("_id")
 
@@ -497,9 +893,7 @@ class VSEBuilder(Vse_renderer):
         )
 
         if preferred:
-            search_order.append(
-                preferred
-            )
+            search_order.append(preferred)
 
         for media_type in clip_ref.get(
             "accepted_types",
@@ -507,17 +901,14 @@ class VSEBuilder(Vse_renderer):
         ):
 
             if media_type not in search_order:
+                search_order.append(media_type)
 
-                search_order.append(
-                    media_type
-                )
+        explicit_type = clip_ref.get("type")
 
-        # If type is explicitly known, prioritize it.
-        explicit_type = clip_ref.get(
-            "type"
-        )
-
-        if explicit_type and explicit_type not in search_order:
+        if (
+            explicit_type
+            and explicit_type not in search_order
+        ):
 
             search_order.insert(
                 0,
@@ -540,27 +931,65 @@ class VSEBuilder(Vse_renderer):
 
                     return {
                         "filepath": str(candidate),
-
                         "media_type": media_type,
-
                         "clip_ref": {
                             **clip_ref,
                             "type": media_type,
                         },
                     }
 
+        if (
+            preferred == "audio"
+            or "audio" in (
+                clip_ref.get(
+                    "accepted_types"
+                )
+                or []
+            )
+            or explicit_type == "audio"
+        ):
+
+            local = self._resolve_local_audio(
+                clip_ref
+            )
+
+            if local:
+                return local
+
         return None
 
-    def _resolve_media(
-        self,
-        clip_ref,
-    ):
+    def _resolve_media(self, clip_ref):
 
         clip_ref = clip_ref or {}
 
         self.log.info(
             f"Resolving media: {clip_ref}"
         )
+
+        preferred = (
+            clip_ref.get("preferred_type")
+            or clip_ref.get("type")
+        )
+
+        accepted = set(
+            clip_ref.get(
+                "accepted_types"
+            )
+            or []
+        )
+
+        if (
+            preferred == "audio"
+            or "audio" in accepted
+            or preferred is None
+        ):
+
+            local = self._resolve_local_audio(
+                clip_ref
+            )
+
+            if local:
+                return local
 
         cached = self._find_cached_media(
             clip_ref
@@ -573,10 +1002,6 @@ class VSEBuilder(Vse_renderer):
                 "resolved": True,
             }
 
-        # =====================================================================
-        # UNRESOLVED ASSET
-        # =====================================================================
-
         if self._is_unresolved_clip_ref(
             clip_ref
         ):
@@ -586,8 +1011,6 @@ class VSEBuilder(Vse_renderer):
                 "image",
             )
 
-            # A malformed preferred type should never prevent the timeline
-            # from being resolved.
             if preferred not in {
                 "video",
                 "audio",
@@ -608,15 +1031,9 @@ class VSEBuilder(Vse_renderer):
                         "preferred_type": preferred,
                     }
                 ),
-
                 "media_type": preferred,
-
                 "resolved": False,
             }
-
-        # =====================================================================
-        # SERVER MEDIA RESOLUTION
-        # =====================================================================
 
         if not self.resolving_media:
 
@@ -626,17 +1043,8 @@ class VSEBuilder(Vse_renderer):
                 "RESOLVING_MEDIA"
             )
 
-        media_type = clip_ref.get(
-            "type"
-        )
-
-        media_id = clip_ref.get(
-            "_id"
-        )
-
-        # =====================================================================
-        # TEXT
-        # =====================================================================
+        media_type = clip_ref.get("type")
+        media_id = clip_ref.get("_id")
 
         if media_type == "text":
 
@@ -645,29 +1053,25 @@ class VSEBuilder(Vse_renderer):
                     "text",
                     "",
                 ),
-
                 "media_type": "text",
-
                 "resolved": True,
             }
-
-        # =====================================================================
-        # SCENE
-        # =====================================================================
 
         if media_type == "scene":
 
             return {
                 "filepath": None,
-
                 "media_type": "scene",
-
                 "resolved": True,
             }
 
-        # =====================================================================
-        # SUPPORTED MEDIA
-        # =====================================================================
+        if media_type == "transform":
+
+            return {
+                "filepath": None,
+                "media_type": "transform",
+                "resolved": True,
+            }
 
         if media_type not in {
             "video",
@@ -676,8 +1080,7 @@ class VSEBuilder(Vse_renderer):
         }:
 
             self.log.error(
-                f"Unsupported media type: "
-                f"{media_type}"
+                f"Unsupported media type: {media_type}"
             )
 
             return None
@@ -685,8 +1088,7 @@ class VSEBuilder(Vse_renderer):
         if not media_id:
 
             self.log.error(
-                "Media has no _id. "
-                "Cannot resolve media."
+                "Media has no _id. Cannot resolve media."
             )
 
             return None
@@ -696,10 +1098,7 @@ class VSEBuilder(Vse_renderer):
             / media_id.replace(":", "_")
         )
 
-        chunks_dir = (
-            media_dir
-            / "chunks"
-        )
+        chunks_dir = media_dir / "chunks"
 
         ext = self._infer_extension(
             clip_ref
@@ -727,10 +1126,6 @@ class VSEBuilder(Vse_renderer):
                 "media_type": media_type,
                 "resolved": True,
             }
-
-        # =====================================================================
-        # FETCH CHUNKS
-        # =====================================================================
 
         self.log.info(
             "Media not cached. Fetching..."
@@ -785,16 +1180,14 @@ class VSEBuilder(Vse_renderer):
                 "data"
             ) or {}
 
-            chunk = data.get(
-                "chunk"
-            )
+            chunk = data.get("chunk")
 
             if not chunk:
 
                 self.log.error(
-                    f"Chunk {index} for "
-                    f"media '{media_id}' "
-                    f"contained no data."
+                    f"Chunk {index} for media "
+                    f"'{media_id}' contained "
+                    f"no data."
                 )
 
                 return None
@@ -813,12 +1206,7 @@ class VSEBuilder(Vse_renderer):
                 total_chunks is not None
                 and index >= total_chunks
             ):
-
                 break
-
-        # =====================================================================
-        # ASSEMBLE
-        # =====================================================================
 
         with open(
             final_path,
@@ -842,8 +1230,7 @@ class VSEBuilder(Vse_renderer):
                 )
 
         self.log.info(
-            f"Media assembled: "
-            f"{final_path}"
+            f"Media assembled: {final_path}"
         )
 
         return {
@@ -862,18 +1249,7 @@ class VSEBuilder(Vse_renderer):
         clip,
     ):
 
-        """
-        Apply only the source offset.
-
-        Editorial duration is controlled by TimelineResolver and applied
-        separately during materialization.
-
-        This method intentionally does NOT determine native duration.
-        """
-
-        cut = clip.get(
-            "cut"
-        ) or {}
+        cut = clip.get("cut") or {}
 
         source_start_ms = 0
 
@@ -911,12 +1287,6 @@ class VSEBuilder(Vse_renderer):
         self,
         clip,
     ):
-        """
-        Attempt to obtain an explicit duration from the editorial clip.
-
-        This is only a fallback. Native media duration remains authoritative
-        whenever media can actually be probed.
-        """
 
         if not clip:
             return None
@@ -933,40 +1303,29 @@ class VSEBuilder(Vse_renderer):
 
             try:
 
-                if isinstance(value, (int, float)):
+                if isinstance(
+                    value,
+                    (int, float),
+                ):
 
-                    # duration_ms is already milliseconds.
-                    if value == clip.get(
-                        "duration_ms"
-                    ):
-
-                        return max(
-                            1,
-                            int(round(value)),
-                        )
-
-                    # Editorial duration is conventionally milliseconds in
-                    # this system.
                     return max(
                         1,
                         int(round(value)),
                     )
 
-                if isinstance(
-                    value,
-                    str,
+                if (
+                    isinstance(value, str)
+                    and self.timeline is not None
                 ):
 
-                    if self.timeline is not None:
-
-                        return max(
-                            1,
-                            int(
-                                self.timeline.resolve_ms(
-                                    value
-                                )
-                            ),
-                        )
+                    return max(
+                        1,
+                        int(
+                            self.timeline.resolve_ms(
+                                value
+                            )
+                        ),
+                    )
 
             except Exception as e:
 
@@ -1007,35 +1366,10 @@ class VSEBuilder(Vse_renderer):
         fps,
     ):
 
-        """
-        Resolve media and determine its native source duration.
-
-        This function MUST be safe to call for every registered clip.
-
-        It does not create permanent VSE strips.
-
-        Video/audio:
-            temporary probe strip -> frame_duration -> remove
-
-        Image:
-            deterministic default duration
-
-        Text:
-            explicit duration if available, otherwise default duration
-
-        Scene:
-            explicit duration if available, otherwise default duration
-
-        Unresolvable media:
-            explicit duration if available, otherwise deterministic fallback
-        """
-
         if not clip:
             return None
 
-        clip_id = clip.get(
-            "_id"
-        )
+        clip_id = clip.get("_id")
 
         if not clip_id:
 
@@ -1045,7 +1379,6 @@ class VSEBuilder(Vse_renderer):
 
             return None
 
-        # Already known.
         if clip_id in self._native_durations:
 
             return self._native_durations[
@@ -1053,20 +1386,13 @@ class VSEBuilder(Vse_renderer):
             ]
 
         self.log.info(
-            f"[PROBE] Starting clip="
-            f"{clip_id}"
+            f"[PROBE] Starting clip={clip_id}"
         )
 
         clip_ref = (
-            clip.get(
-                "clip_ref"
-            )
+            clip.get("clip_ref")
             or {}
         )
-
-        # ---------------------------------------------------------------------
-        # Resolve media
-        # ---------------------------------------------------------------------
 
         media = self._resolve_media(
             clip_ref
@@ -1076,11 +1402,9 @@ class VSEBuilder(Vse_renderer):
 
             self.log.warning(
                 f"[PROBE] Media resolution "
-                f"failed for clip "
-                f"'{clip_id}'."
+                f"failed for clip '{clip_id}'."
             )
 
-            # Try explicit editorial duration.
             explicit_ms = (
                 self._duration_from_clip_definition(
                     clip
@@ -1101,16 +1425,8 @@ class VSEBuilder(Vse_renderer):
                     frames,
                 )
 
-                self.log.warning(
-                    f"[PROBE] Using explicit "
-                    f"duration for "
-                    f"'{clip_id}': "
-                    f"{frames} frames"
-                )
-
                 return frames
 
-            # Final deterministic fallback.
             frames = max(
                 1,
                 round(
@@ -1126,13 +1442,6 @@ class VSEBuilder(Vse_renderer):
 
             self._probe_failures.add(
                 clip_id
-            )
-
-            self.log.warning(
-                f"[PROBE] Using fallback "
-                f"duration for "
-                f"'{clip_id}': "
-                f"{frames} frames"
             )
 
             return frames
@@ -1155,54 +1464,11 @@ class VSEBuilder(Vse_renderer):
             "media_type"
         )
 
-        # ---------------------------------------------------------------------
-        # TEXT
-        # ---------------------------------------------------------------------
-
-        if media_type == "text":
-
-            explicit_ms = (
-                self._duration_from_clip_definition(
-                    clip
-                )
-            )
-
-            if explicit_ms is not None:
-
-                duration = max(
-                    1,
-                    self.timeline.ms_to_frames(
-                        explicit_ms
-                    ),
-                )
-
-            else:
-
-                duration = max(
-                    1,
-                    round(
-                        fps
-                        * DEFAULT_UNRESOLVED_DURATION_SECONDS
-                    ),
-                )
-
-            self._store_native_duration(
-                clip_id,
-                duration,
-            )
-
-            self.log.info(
-                f"[PROBE] text={clip_id} "
-                f"native={duration} frames"
-            )
-
-            return duration
-
-        # ---------------------------------------------------------------------
-        # SCENE
-        # ---------------------------------------------------------------------
-
-        if media_type == "scene":
+        if media_type in {
+            "text",
+            "scene",
+            "transform",
+        }:
 
             explicit_ms = (
                 self._duration_from_clip_definition(
@@ -1234,16 +1500,7 @@ class VSEBuilder(Vse_renderer):
                 duration,
             )
 
-            self.log.info(
-                f"[PROBE] scene={clip_id} "
-                f"native={duration} frames"
-            )
-
             return duration
-
-        # ---------------------------------------------------------------------
-        # IMAGE
-        # ---------------------------------------------------------------------
 
         if media_type == "image":
 
@@ -1277,27 +1534,12 @@ class VSEBuilder(Vse_renderer):
                 duration,
             )
 
-            self.log.info(
-                f"[PROBE] image={clip_id} "
-                f"native={duration} frames"
-            )
-
             return duration
-
-        # ---------------------------------------------------------------------
-        # UNSUPPORTED
-        # ---------------------------------------------------------------------
 
         if media_type not in {
             "video",
             "audio",
         }:
-
-            self.log.warning(
-                f"[PROBE] Unsupported media "
-                f"type '{media_type}' "
-                f"for clip '{clip_id}'"
-            )
 
             explicit_ms = (
                 self._duration_from_clip_definition(
@@ -1337,11 +1579,6 @@ class VSEBuilder(Vse_renderer):
 
         if not filepath:
 
-            self.log.warning(
-                f"[PROBE] No filepath for "
-                f"clip '{clip_id}'"
-            )
-
             explicit_ms = (
                 self._duration_from_clip_definition(
                     clip
@@ -1374,10 +1611,6 @@ class VSEBuilder(Vse_renderer):
 
             return duration
 
-        # ---------------------------------------------------------------------
-        # ACTUAL NATIVE PROBE
-        # ---------------------------------------------------------------------
-
         duration = (
             self._probe_native_duration_frames(
                 filepath=filepath,
@@ -1393,23 +1626,7 @@ class VSEBuilder(Vse_renderer):
                 duration,
             )
 
-            self.log.info(
-                f"[PROBE] clip={clip_id} "
-                f"native={duration} frames "
-                f"({duration / fps:.3f}s)"
-            )
-
             return duration
-
-        # ---------------------------------------------------------------------
-        # PROBE FAILED - FALLBACK
-        # ---------------------------------------------------------------------
-
-        self.log.warning(
-            f"[PROBE] Failed to determine "
-            f"native duration for "
-            f"'{clip_id}'."
-        )
 
         explicit_ms = (
             self._duration_from_clip_definition(
@@ -1445,12 +1662,6 @@ class VSEBuilder(Vse_renderer):
             clip_id
         )
 
-        self.log.warning(
-            f"[PROBE] Fallback native "
-            f"duration for '{clip_id}' = "
-            f"{fallback} frames"
-        )
-
         return fallback
 
     def _probe_native_duration_frames(
@@ -1460,31 +1671,11 @@ class VSEBuilder(Vse_renderer):
         clip_id,
     ):
 
-        """
-        Safely probe native media duration.
-
-        The temporary strip exists only for the duration of this method.
-
-        IMPORTANT:
-
-        - Never use an arbitrary/high permanent channel.
-        - Never apply editorial cuts to the probe.
-        - Read frame_duration.
-        - Always remove the strip in finally.
-        """
-
         strip = None
 
         try:
 
             name = self._next_probe_name()
-
-            self.log.info(
-                f"[PROBE] Creating temporary "
-                f"{kind} strip '{name}' "
-                f"on channel "
-                f"{PROBE_CHANNEL}"
-            )
 
             if kind == "video":
 
@@ -1511,22 +1702,11 @@ class VSEBuilder(Vse_renderer):
             else:
 
                 raise ValueError(
-                    f"Unsupported probe type: "
-                    f"{kind}"
+                    f"Unsupported probe type: {kind}"
                 )
-
-            # -----------------------------------------------------------------
-            # Read native duration BEFORE ANY CUT.
-            # -----------------------------------------------------------------
 
             duration = int(
                 strip.frame_duration
-            )
-
-            self.log.info(
-                f"[PROBE] {clip_id}: "
-                f"native frame_duration="
-                f"{duration}"
             )
 
             return max(
@@ -1537,9 +1717,8 @@ class VSEBuilder(Vse_renderer):
         except Exception as e:
 
             self.log.error(
-                f"[PROBE] Failed for "
-                f"clip '{clip_id}' "
-                f"'{filepath}': {e}"
+                f"[PROBE] Failed for clip "
+                f"'{clip_id}' '{filepath}': {e}"
             )
 
             return None
@@ -1548,75 +1727,60 @@ class VSEBuilder(Vse_renderer):
 
             if strip is not None:
 
-                self._remove_strip_safely(strip)
+                self._remove_strip_safely(
+                    strip
+                )
 
     def _remove_strip_safely(
         self,
         strip,
         max_attempts=2,
     ):
-        """
-        Remove a strip and CONFIRM it's actually gone, rather than
-        trusting a bare remove() call. If a probe strip survives, it
-        sits on PROBE_CHANNEL and causes the *next* probe created at
-        the same (channel, frame) to collide and get bumped to the
-        next channel up - which is how stray content ends up on
-        channel 10 (or higher) even though nothing is ever
-        deliberately placed there.
-        """
 
-        name = getattr(strip, "name", "<unknown>")
+        name = getattr(
+            strip,
+            "name",
+            "<unknown>",
+        )
 
-        for attempt in range(1, max_attempts + 1):
+        for attempt in range(
+            1,
+            max_attempts + 1,
+        ):
 
             try:
 
-                self.sequencer.sequences.remove(strip)
+                self.sequencer.sequences.remove(
+                    strip
+                )
 
             except Exception as e:
 
                 self.log.warning(
-                    f"[PROBE] remove() raised for "
-                    f"'{name}' (attempt {attempt}): {e}"
+                    f"[PROBE] remove() raised "
+                    f"for '{name}' "
+                    f"(attempt {attempt}): {e}"
                 )
 
-            still_present = self.sequencer.sequences.get(name)
+            still_present = (
+                self.sequencer.sequences.get(
+                    name
+                )
+            )
 
             if still_present is None:
 
-                self.log.info(
-                    f"[PROBE] Removed temporary strip '{name}'"
-                )
-
                 return True
-
-            self.log.warning(
-                f"[PROBE] Strip '{name}' still present after "
-                f"remove() attempt {attempt}"
-            )
 
             strip = still_present
 
-        self.log.error(
-            f"[PROBE] Could not remove probe strip '{name}' "
-            f"after {max_attempts} attempt(s) - it will be "
-            f"purged in the end-of-pass sweep."
-        )
-
         return False
 
-
     def _purge_stray_probe_strips(self):
-        """
-        Belt-and-suspenders: remove anything left on or above
-        PROBE_CHANNEL after probing finishes. Nothing in a normal
-        build is ever deliberately placed there, so if this finds
-        anything, a probe removal failed somewhere - this guarantees
-        it can't survive into the final render regardless.
-        """
 
         stray = [
-            s for s in self.sequencer.sequences_all
+            s
+            for s in self.sequencer.sequences_all
             if s.channel >= PROBE_CHANNEL
         ]
 
@@ -1626,16 +1790,25 @@ class VSEBuilder(Vse_renderer):
             channel = s.channel
 
             try:
-                self.sequencer.sequences.remove(s)
+
+                self.sequencer.sequences.remove(
+                    s
+                )
+
                 self.log.warning(
-                    f"[PROBE] Purged stray strip '{name}' "
+                    f"[PROBE] Purged stray "
+                    f"strip '{name}' "
                     f"left on channel {channel}"
                 )
+
             except Exception as e:
+
                 self.log.error(
-                    f"[PROBE] Failed to purge stray strip "
-                    f"'{name}' on channel {channel}: {e}"
+                    f"[PROBE] Failed to purge "
+                    f"strip '{name}' "
+                    f"on channel {channel}: {e}"
                 )
+
     # =========================================================================
     # CRITICAL: LAZY DURATION PROVIDER
     # =========================================================================
@@ -1645,39 +1818,12 @@ class VSEBuilder(Vse_renderer):
         clip_id,
     ):
 
-        """
-        Duration provider used by TimelineResolver.
-
-        This method is intentionally defensive.
-
-        TimelineResolver is allowed to ask for a duration at any point during
-        resolution. Therefore we cannot assume Pass 2 has already populated
-        _native_durations.
-
-        Resolution order:
-
-            1. Existing probed native duration
-            2. Lazily probe the indexed clip
-            3. Explicit clip duration
-            4. Deterministic fallback
-
-        It should therefore never produce the old:
-
-            No available probe duration for clip ...
-
-        unless the clip genuinely cannot be identified at all.
-        """
-
         if not clip_id:
 
             raise TimelineResolutionError(
-                "Cannot resolve duration for "
-                "clip with no id."
+                "Cannot resolve duration "
+                "for clip with no id."
             )
-
-        # ---------------------------------------------------------------------
-        # 1. Already probed
-        # ---------------------------------------------------------------------
 
         duration_frames = (
             self._native_durations.get(
@@ -1693,22 +1839,14 @@ class VSEBuilder(Vse_renderer):
                 / self.fps
             )
 
-        # ---------------------------------------------------------------------
-        # 2. Lazy probe
-        # ---------------------------------------------------------------------
-
-        clip = (
-            self._clips_by_id.get(
-                clip_id
-            )
+        clip = self._clips_by_id.get(
+            clip_id
         )
 
         if clip is not None:
 
-            track = (
-                self._clip_tracks.get(
-                    clip_id
-                )
+            track = self._clip_tracks.get(
+                clip_id
             )
 
             if self.timeline is not None:
@@ -1728,10 +1866,6 @@ class VSEBuilder(Vse_renderer):
                         * 1000
                         / self.fps
                     )
-
-        # ---------------------------------------------------------------------
-        # 3. Explicit duration fallback
-        # ---------------------------------------------------------------------
 
         if clip is not None:
 
@@ -1761,10 +1895,6 @@ class VSEBuilder(Vse_renderer):
                     / self.fps
                 )
 
-        # ---------------------------------------------------------------------
-        # 4. Deterministic fallback
-        # ---------------------------------------------------------------------
-
         fallback_frames = max(
             1,
             round(
@@ -1778,13 +1908,6 @@ class VSEBuilder(Vse_renderer):
             fallback_frames,
         )
 
-        self.log.warning(
-            f"[DURATION] No native duration "
-            f"was available for clip "
-            f"'{clip_id}'. Using fallback "
-            f"{fallback_frames} frames."
-        )
-
         return round(
             fallback_frames
             * 1000
@@ -1792,7 +1915,7 @@ class VSEBuilder(Vse_renderer):
         )
 
     # =========================================================================
-    # TRACK MEDIA TYPE
+    # TRACK MEDIA TYPE / ROLE
     # =========================================================================
 
     def _infer_track_media_type(
@@ -1806,18 +1929,13 @@ class VSEBuilder(Vse_renderer):
         ):
 
             clip_ref = (
-                clip.get(
-                    "clip_ref",
-                    {},
-                )
+                clip.get("clip_ref")
                 or {}
             )
 
             media_type = (
                 clip_ref.get("type")
-                or clip_ref.get(
-                    "preferred_type"
-                )
+                or clip_ref.get("preferred_type")
             )
 
             if media_type in {
@@ -1828,18 +1946,12 @@ class VSEBuilder(Vse_renderer):
                 return "video"
 
             if media_type == "audio":
-
                 return "audio"
 
             if media_type == "text":
-
                 return "text"
 
         return None
-
-    # =========================================================================
-    # TRACK ROLE
-    # =========================================================================
 
     def _assign_track_role(
         self,
@@ -1856,10 +1968,8 @@ class VSEBuilder(Vse_renderer):
                 track_type
             ]
 
-        guess = (
-            self._infer_track_media_type(
-                track
-            )
+        guess = self._infer_track_media_type(
+            track
         )
 
         if guess == "video":
@@ -1873,9 +1983,22 @@ class VSEBuilder(Vse_renderer):
 
         return None
 
-    def _locked_channels(
+    def _is_positionable_track(
         self,
         track,
+    ):
+
+        return (
+            self._assign_track_role(track)
+            is not None
+        )
+
+    def _resolve_channels(
+        self,
+        clip,
+        track,
+        start_frame,
+        duration_frames,
     ):
 
         role = self._assign_track_role(
@@ -1883,85 +2006,36 @@ class VSEBuilder(Vse_renderer):
         )
 
         if role is None:
-            return None
-
-        return ROLE_CHANNELS.get(
-            role
-        )
-
-    # =========================================================================
-    # CHANNEL RESOLUTION
-    # =========================================================================
-
-    def _resolve_channels(
-        self,
-        clip,
-        track,
-    ):
-
-        """
-        Return:
-
-            video_channel,
-            audio_channel
-
-        based on the locked role of the track.
-        """
-
-        channels = self._locked_channels(
-            track
-        )
-
-        if channels is None:
             return None, None
 
-        video_channel, audio_channel = (
-            channels
-        )
-
         clip_ref = (
-            clip.get(
-                "clip_ref"
-            )
+            clip.get("clip_ref")
             or {}
         )
 
         media = (
-            clip.get(
-                "_resolved_media"
-            )
+            clip.get("_resolved_media")
             or {}
         )
 
         media_type = (
-            media.get(
-                "media_type"
-            )
-            or clip_ref.get(
-                "type"
-            )
-            or clip_ref.get(
-                "preferred_type"
-            )
+            media.get("media_type")
+            or clip_ref.get("type")
+            or clip_ref.get("preferred_type")
         )
 
-        if media_type == "audio":
+        prefer_pair = (
+            media_type == "video"
+        )
 
-            return (
-                None,
-                audio_channel,
-            )
-
-        if media_type == "text":
-
-            return (
-                video_channel,
-                None,
-            )
-
-        return (
-            video_channel,
-            audio_channel,
+        return self.channel_allocator.allocate(
+            role=role,
+            start_frame=int(start_frame),
+            end_frame=int(
+                start_frame
+                + duration_frames
+            ),
+            prefer_pair=prefer_pair,
         )
 
     # =========================================================================
@@ -1995,12 +2069,13 @@ class VSEBuilder(Vse_renderer):
                 "resolved"
             ]
 
-            (
-                video_channel,
-                audio_channel,
-            ) = self._resolve_channels(
-                clip,
-                track,
+            video_channel, audio_channel = (
+                self._resolve_channels(
+                    clip,
+                    track,
+                    start_frame,
+                    duration_frames,
+                )
             )
 
             if video_channel is None:
@@ -2009,17 +2084,6 @@ class VSEBuilder(Vse_renderer):
                     "No video channel "
                     "available for video clip."
                 )
-
-            if audio_channel is None:
-
-                raise ValueError(
-                    "No audio channel "
-                    "available for video clip."
-                )
-
-            # -----------------------------------------------------------------
-            # VIDEO
-            # -----------------------------------------------------------------
 
             video_name = (
                 self._next_video_name()
@@ -2057,70 +2121,58 @@ class VSEBuilder(Vse_renderer):
                 int(duration_frames),
             )
 
-            # -----------------------------------------------------------------
-            # AUDIO
-            # -----------------------------------------------------------------
+            if audio_channel is not None:
 
-            audio_name = (
-                self._next_audio_name()
-            )
-
-            audio = (
-                self.sequencer.sequences.new_sound(
-                    name=audio_name,
-                    filepath=filepath,
-                    frame_start=int(
-                        start_frame
-                    ),
-                    channel=int(
-                        audio_channel
-                    ),
+                audio_name = (
+                    self._next_audio_name()
                 )
-            )
 
-            self._attach_strip_metadata(
-                audio,
-                clip,
-                clip_ref,
-                resolved,
-            )
+                audio = (
+                    self.sequencer.sequences.new_sound(
+                        name=audio_name,
+                        filepath=filepath,
+                        frame_start=int(
+                            start_frame
+                        ),
+                        channel=int(
+                            audio_channel
+                        ),
+                    )
+                )
 
-            audio["strip_role"] = "audio"
+                self._attach_strip_metadata(
+                    audio,
+                    clip,
+                    clip_ref,
+                    resolved,
+                )
 
-            video["paired_audio"] = (
-                audio.name
-            )
+                audio["strip_role"] = "audio"
 
-            audio["paired_video"] = (
-                video.name
-            )
+                video["paired_audio"] = (
+                    audio.name
+                )
 
-            self._apply_cut_and_duration(
-                audio,
-                clip,
-            )
+                audio["paired_video"] = (
+                    video.name
+                )
 
-            audio.frame_final_duration = max(
-                1,
-                int(duration_frames),
-            )
+                self._apply_cut_and_duration(
+                    audio,
+                    clip,
+                )
 
-            self.log.info(
-                f"Added VIDEO+AUD "
-                f"{video.name}/{audio.name} "
-                f"ch={video_channel}/"
-                f"{audio_channel} "
-                f"start={start_frame} "
-                f"dur={duration_frames}"
-            )
+                audio.frame_final_duration = max(
+                    1,
+                    int(duration_frames),
+                )
 
             return video
 
         except Exception as e:
 
             self.log.error(
-                f"Failed adding "
-                f"VIDEO/AUDIO: {e}"
+                f"Failed adding VIDEO/AUDIO: {e}"
             )
 
             return None
@@ -2156,19 +2208,19 @@ class VSEBuilder(Vse_renderer):
                 "resolved"
             ]
 
-            (
-                _,
-                audio_channel,
-            ) = self._resolve_channels(
-                clip,
-                track,
+            _, audio_channel = (
+                self._resolve_channels(
+                    clip,
+                    track,
+                    start_frame,
+                    duration_frames,
+                )
             )
 
             if audio_channel is None:
 
                 raise ValueError(
-                    "No audio channel "
-                    "available."
+                    "No audio channel available."
                 )
 
             name = (
@@ -2209,21 +2261,12 @@ class VSEBuilder(Vse_renderer):
                 int(duration_frames),
             )
 
-            self.log.info(
-                f"Created AUDIO ONLY "
-                f"{audio.name} "
-                f"ch={audio_channel} "
-                f"start={start_frame} "
-                f"dur={duration_frames}"
-            )
-
             return audio
 
         except Exception as e:
 
             self.log.error(
-                f"Failed to add "
-                f"AUDIO ONLY: {e}"
+                f"Failed to add AUDIO ONLY: {e}"
             )
 
             return None
@@ -2262,18 +2305,18 @@ class VSEBuilder(Vse_renderer):
             if not filepath:
 
                 self.log.error(
-                    "Failed to resolve "
-                    "image media."
+                    "Failed to resolve image media."
                 )
 
                 return None
 
-            (
-                video_channel,
-                _,
-            ) = self._resolve_channels(
-                clip,
-                track,
+            video_channel, _ = (
+                self._resolve_channels(
+                    clip,
+                    track,
+                    start_frame,
+                    duration_frames,
+                )
             )
 
             if video_channel is None:
@@ -2313,12 +2356,8 @@ class VSEBuilder(Vse_renderer):
                 resolved,
             )
 
-            self.log.info(
-                f"Created IMAGE strip: "
-                f"{image_strip.name} "
-                f"ch={video_channel} "
-                f"start={start_frame} "
-                f"dur={duration_frames}"
+            image_strip["strip_role"] = (
+                "image"
             )
 
             return image_strip
@@ -2330,6 +2369,877 @@ class VSEBuilder(Vse_renderer):
             )
 
             return None
+
+    # =========================================================================
+    # DECLARED TRANSFORMS
+    #
+    # Transforms belong to the clip that declares them.
+    #
+    # Example:
+    #
+    # "transforms": {
+    #     "translate_x": [
+    #         {
+    #             "t": {
+    #                 "type": "expression",
+    #                 "value": "scene:abc:start"
+    #             },
+    #             "value": 0
+    #         },
+    #         {
+    #             "t": {
+    #                 "type": "expression",
+    #                 "value": "scene:abc:start + 2"
+    #             },
+    #             "value": 500
+    #         }
+    #     ],
+    #     "scale_x": [...],
+    #     "scale_y": [...],
+    #     "rotation": [...],
+    #     "color": [...]
+    # }
+    #
+    # Both shapes are accepted for each transform:
+    #
+    # 1) Bare keyframe list:
+    #     "color": [
+    #         {"t": 0, "value": "#ffffff"},
+    #         {"t": 1, "value": "#ffcc33"}
+    #     ]
+    #
+    # 2) Wrapped with curve:
+    #     "color": {
+    #         "curve": "constant",
+    #         "keyframes": [
+    #             {"t": 0, "value": "#ffffff"},
+    #             {"t": 1, "value": "#ffcc33"}
+    #         ]
+    #     }
+    #
+    # Both are normalized to a single internal shape:
+    #     {"curve": "...", "keyframes": [...]}
+    #
+    # The curve controls Blender keyframe interpolation:
+    #     "linear"   -> LINEAR
+    #     "constant" -> CONSTANT  (no blending, hold previous value)
+    #     "bezier"   -> BEZIER
+    #
+    # Use "constant" for karaoke-style word highlighting: Blender
+    # holds the previous color exactly and jumps instantly to the
+    # next one, with no fading or color interpolation.
+    #
+    # NO separate TRANSFORM effect strip is ever created.
+    # The keyframes are written directly onto the target VSE strip.
+    # =========================================================================
+
+    def _get_declared_transforms(self, clip):
+        """
+        Return the transform declaration belonging to a clip.
+
+        The canonical location is:
+
+            clip["transforms"]
+
+        For compatibility, also check clip_ref["transforms"].
+        """
+        if not clip:
+            return {}
+
+        transforms = clip.get("transforms")
+
+        if isinstance(transforms, dict):
+            return transforms
+
+        clip_ref = clip.get("clip_ref") or {}
+
+        transforms = clip_ref.get("transforms")
+
+        if isinstance(transforms, dict):
+            return transforms
+
+        return {}
+
+    def _normalize_transform(self, transform_data):
+        """
+        Normalize a single transform's value into a single internal shape.
+
+        Accepts EITHER:
+
+            1) A bare list of keyframes:
+                [
+                    {"t": 0, "value": "#ffffff"},
+                    {"t": 1, "value": "#ffcc33"}
+                ]
+
+            2) A dict with curve + keyframes:
+                {
+                    "curve": "constant",
+                    "keyframes": [
+                        {"t": 0, "value": "#ffffff"},
+                        {"t": 1, "value": "#ffcc33"}
+                    ]
+                }
+
+        Returns the unified internal shape:
+
+            {
+                "curve": "linear" | "constant" | "bezier",
+                "keyframes": [ ... ]
+            }
+        """
+        if isinstance(transform_data, list):
+            return {
+                "curve": "linear",
+                "keyframes": transform_data,
+            }
+
+        if isinstance(transform_data, dict):
+            curve = transform_data.get("curve", "linear")
+            keyframes = transform_data.get("keyframes", [])
+            return {
+                "curve": curve if curve in INTERPOLATION_MAP else "linear",
+                "keyframes": keyframes,
+            }
+
+        return {
+            "curve": "linear",
+            "keyframes": [],
+        }
+
+    def _resolve_transform_time(self, value):
+        """
+        Resolve a transform keyframe time into a Blender frame.
+
+        Supported forms:
+
+            12
+            12.0
+
+            {
+                "type": "expression",
+                "value": "scene:abc:start + 2.5"
+            }
+
+        The expression is resolved by TimelineResolver, exactly like
+        normal clip start/end expressions.
+        """
+        if value is None:
+            raise TimelineResolutionError(
+                "Transform keyframe has no time value."
+            )
+
+        # Already a numeric frame/time value.
+        if isinstance(value, (int, float)):
+            return int(round(value))
+
+        if self.timeline is None:
+            raise TimelineResolutionError(
+                "Cannot resolve transform time before timeline exists."
+            )
+
+        # A full timing object, e.g. {"type": "expression", "value": "..."}.
+        # Pass it through untouched so TimelineResolver.resolve_ms() can
+        # dispatch on its own "type" field (this is what "expression",
+        # "percentage", "reference", etc. all need).
+        if isinstance(value, dict):
+            milliseconds = self.timeline.resolve_ms(value)
+            return int(self.timeline.ms_to_frames(milliseconds))
+
+        # A bare expression string with no "type" wrapper.
+        if isinstance(value, str):
+            milliseconds = self.timeline.resolve_expression(value)
+            return int(self.timeline.ms_to_frames(milliseconds))
+
+        raise TimelineResolutionError(
+            f"Unsupported transform time value: {value!r}"
+        )
+
+    def _hex_to_rgba(self, value):
+        """
+        Convert:
+
+            #RRGGBB
+            #RRGGBBAA
+            RRGGBB
+            RRGGBBAA
+
+        into Blender's normalized RGBA tuple.
+        """
+        if value is None:
+            raise ValueError("Color value cannot be None.")
+
+        value = str(value).strip().lstrip("#")
+
+        if len(value) == 6:
+            value += "ff"
+
+        if len(value) != 8:
+            raise ValueError(
+                f"Invalid color '{value}'. Expected "
+                f"#RRGGBB or #RRGGBBAA."
+            )
+
+        try:
+            return tuple(
+                int(value[index:index + 2], 16) / 255.0
+                for index in range(0, 8, 2)
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid hexadecimal color '{value}'."
+            ) from exc
+
+    # -------------------------------------------------------------------------
+    # Fcurve lookup
+    # -------------------------------------------------------------------------
+
+    def _find_strip_fcurves(self, strip, data_path):
+        """
+        Find ALL fcurves on the scene's action that correspond to
+        (strip, data_path) for sequence-strip keyframes.
+
+        Sequence strip keyframes live in the scene's animation action.
+        The fcurve data_path is a fully-qualified RNA path that
+        contains the strip's name, e.g.:
+
+            sequence_editor.sequences_all["V001"].transform.offset_x
+
+        CRITICAL: for multi-component properties (RGBA color has
+        R, G, B, A), Blender creates ONE fcurve per component, all
+        sharing the same data_path but with different `array_index`
+        values (0, 1, 2, 3). ALL of them must be located and
+        modified, otherwise the rendered result will be a blend of
+        CONSTANT and BEZIER components — which looks like a
+        gradual fade even when the user asked for a sharp switch.
+        """
+        scene = bpy.context.scene
+
+        if (
+            scene is None
+            or scene.animation_data is None
+            or scene.animation_data.action is None
+        ):
+            return []
+
+        action = scene.animation_data.action
+
+        strip_name = getattr(strip, "name", None)
+
+        if not strip_name:
+            return []
+
+        matches = []
+
+        for fc in action.fcurves:
+            if strip_name not in fc.data_path:
+                continue
+            # Require a "." before the property name so we don't
+            # accidentally match "wrap_color" or "bgcolor" when
+            # looking for "color".
+            if not fc.data_path.endswith(f".{data_path}"):
+                continue
+            matches.append(fc)
+
+        return matches
+
+    def _set_keyframe_interpolation(
+        self,
+        strip,
+        data_path,
+        frame,
+        interpolation,
+    ):
+        """
+        Set the interpolation mode of the keyframe at `frame` on
+        EVERY fcurve that belongs to (strip, data_path).
+
+        This must iterate over ALL matching fcurves, not just the
+        first. For a TEXT strip's `color` property, Blender creates
+        4 fcurves (R, G, B, A). If only one of them gets its
+        interpolation switched to CONSTANT, the other three stay
+        on BEZIER and the rendered color fades smoothly between
+        keyframes — which is the exact "not a sharp switch"
+        symptom you see when CONSTANT isn't really applied.
+
+        Returns the number of fcurves whose keyframe was
+        successfully modified.
+        """
+        interpolation = str(interpolation).upper()
+
+        if interpolation not in {"LINEAR", "CONSTANT", "BEZIER"}:
+            interpolation = "LINEAR"
+
+        strip_name = getattr(strip, "name", None)
+
+        if not strip_name:
+            return 0
+
+        matched = self._find_strip_fcurves(
+            strip,
+            data_path,
+        )
+
+        if not matched:
+
+            # Diagnostic: log whatever fcurves DO exist for this
+            # strip so a wrong data_path or a missing action is
+            # obvious from the log.
+            scene = bpy.context.scene
+            existing = []
+
+            if (
+                scene is not None
+                and scene.animation_data is not None
+                and scene.animation_data.action is not None
+            ):
+                existing = [
+                    fc.data_path
+                    for fc in scene.animation_data.action.fcurves
+                    if strip_name in fc.data_path
+                ]
+
+            self.log.warning(
+                f"[TRANSFORM] No fcurve found for "
+                f"strip='{strip_name}' data_path='{data_path}' "
+                f"frame={frame}. "
+                f"Existing fcurves containing this strip: {existing}"
+            )
+
+            return 0
+
+        modified = 0
+
+        for fc in matched:
+
+            for kp in fc.keyframe_points:
+
+                if int(kp.co[0]) != int(frame):
+                    continue
+
+                try:
+                    kp.interpolation = interpolation
+                    # Clamp handles so the graph editor doesn't
+                    # show misleading tangents. For CONSTANT
+                    # specifically, handles are ignored, but
+                    # setting them keeps the representation sane.
+                    kp.handle_left_type = "AUTO_CLAMPED"
+                    kp.handle_right_type = "AUTO_CLAMPED"
+
+                    # Force the fcurve to re-evaluate.
+                    fc.update()
+
+                    actual = kp.interpolation
+
+                    if actual == interpolation:
+
+                        self.log.info(
+                            f"[TRANSFORM] Set "
+                            f"interpolation={interpolation} "
+                            f"on {strip_name}."
+                            f"{fc.data_path}[{fc.array_index}] "
+                            f"frame={frame}"
+                        )
+
+                        modified += 1
+
+                    else:
+
+                        self.log.warning(
+                            f"[TRANSFORM] Interpolation "
+                            f"did not stick: "
+                            f"requested={interpolation} "
+                            f"actual={actual} "
+                            f"on {strip_name}."
+                            f"{fc.data_path}[{fc.array_index}] "
+                            f"frame={frame}"
+                        )
+
+                except Exception as exc:
+                    self.log.warning(
+                        f"[TRANSFORM] Could not set "
+                        f"interpolation on "
+                        f"{strip_name}."
+                        f"{fc.data_path}[{fc.array_index}] "
+                        f"frame {frame}: {exc}"
+                    )
+
+                # Only the first matching keyframe per fcurve.
+                break
+
+        if modified == 0:
+
+            self.log.warning(
+                f"[TRANSFORM] Matched {len(matched)} fcurve(s) "
+                f"for {strip_name}.{data_path} but no keyframe "
+                f"was found at frame {frame} on any of them."
+            )
+
+        return modified
+
+    def _keyframe_strip_property(
+        self,
+        strip,
+        data_path,
+        frame,
+        index=None,
+        interpolation="LINEAR",
+    ):
+        """
+        Insert a keyframe on a sequence-strip property AND set its
+        interpolation mode.
+
+        Keeping this isolated makes Blender-version differences
+        (where the keyframe can actually be addressed) easier to
+        handle.
+        """
+        frame = int(frame)
+
+        interpolation = str(interpolation).upper()
+
+        if interpolation not in {"LINEAR", "CONSTANT", "BEZIER"}:
+            interpolation = "LINEAR"
+
+        try:
+            if index is None:
+                strip.keyframe_insert(
+                    data_path=data_path,
+                    frame=frame,
+                )
+            else:
+                strip.keyframe_insert(
+                    data_path=data_path,
+                    index=index,
+                    frame=frame,
+                )
+
+        except Exception as exc:
+
+            self.log.error(
+                f"[TRANSFORM] Failed keyframe_insert "
+                f"strip={getattr(strip, 'name', '<unknown>')} "
+                f"path={data_path} "
+                f"index={index} "
+                f"frame={frame}: {exc}"
+            )
+
+            return False
+
+        # Now set the interpolation on the just-inserted keyframe.
+        # For multi-component properties (RGBA color) this must hit
+        # every fcurve, otherwise the rendered result is a blend
+        # of CONSTANT and BEZIER components and you get a visible
+        # smooth fade between the "snap" colors.
+        modified = self._set_keyframe_interpolation(
+            strip=strip,
+            data_path=data_path,
+            frame=frame,
+            interpolation=interpolation,
+        )
+
+        if modified == 0:
+            self.log.warning(
+                f"[TRANSFORM] keyframe_insert OK but no fcurve "
+                f"interpolation was set on "
+                f"strip={getattr(strip, 'name', '<unknown>')} "
+                f"path={data_path} frame={frame} "
+                f"interpolation={interpolation}. "
+                f"Keyframe will fall back to Blender's default "
+                f"interpolation (BEZIER)."
+            )
+
+        return True
+
+    def _apply_translate_x_keyframe(
+        self,
+        strip,
+        frame,
+        value,
+        interpolation="LINEAR",
+    ):
+        transform = getattr(strip, "transform", None)
+
+        if transform is None:
+            raise ValueError(
+                f"Strip '{strip.name}' has no transform data."
+            )
+
+        transform.offset_x = float(value)
+
+        return self._keyframe_strip_property(
+            strip,
+            "transform.offset_x",
+            frame,
+            interpolation=interpolation,
+        )
+
+    def _apply_translate_y_keyframe(
+        self,
+        strip,
+        frame,
+        value,
+        interpolation="LINEAR",
+    ):
+        transform = getattr(strip, "transform", None)
+
+        if transform is None:
+            raise ValueError(
+                f"Strip '{strip.name}' has no transform data."
+            )
+
+        transform.offset_y = float(value)
+
+        return self._keyframe_strip_property(
+            strip,
+            "transform.offset_y",
+            frame,
+            interpolation=interpolation,
+        )
+
+    def _apply_scale_x_keyframe(
+        self,
+        strip,
+        frame,
+        value,
+        interpolation="LINEAR",
+    ):
+        transform = getattr(strip, "transform", None)
+
+        if transform is None:
+            raise ValueError(
+                f"Strip '{strip.name}' has no transform data."
+            )
+
+        transform.scale_x = float(value)
+
+        return self._keyframe_strip_property(
+            strip,
+            "transform.scale_x",
+            frame,
+            interpolation=interpolation,
+        )
+
+    def _apply_scale_y_keyframe(
+        self,
+        strip,
+        frame,
+        value,
+        interpolation="LINEAR",
+    ):
+        transform = getattr(strip, "transform", None)
+
+        if transform is None:
+            raise ValueError(
+                f"Strip '{strip.name}' has no transform data."
+            )
+
+        transform.scale_y = float(value)
+
+        return self._keyframe_strip_property(
+            strip,
+            "transform.scale_y",
+            frame,
+            interpolation=interpolation,
+        )
+
+    def _apply_rotation_keyframe(
+        self,
+        strip,
+        frame,
+        value,
+        interpolation="LINEAR",
+    ):
+        transform = getattr(strip, "transform", None)
+
+        if transform is None:
+            raise ValueError(
+                f"Strip '{strip.name}' has no transform data."
+            )
+
+        # JSON uses degrees.
+        # Blender stores sequence rotation in radians.
+        transform.rotation = math.radians(float(value))
+
+        return self._keyframe_strip_property(
+            strip,
+            "transform.rotation",
+            frame,
+            interpolation=interpolation,
+        )
+
+    def _apply_color_keyframe(
+        self,
+        strip,
+        frame,
+        value,
+        interpolation="LINEAR",
+    ):
+        """
+        Apply a color keyframe directly to the target strip.
+
+        This is primarily intended for TEXT strips, which expose
+        `color`.
+        """
+        if not hasattr(strip, "color"):
+
+            self.log.warning(
+                f"[TRANSFORM] Strip '{strip.name}' does not expose "
+                f"a color property; skipping color keyframe."
+            )
+            return False
+
+        rgba = self._hex_to_rgba(value)
+
+        strip.color = rgba
+
+        return self._keyframe_strip_property(
+            strip,
+            "color",
+            frame,
+            interpolation=interpolation,
+        )
+
+    def _apply_transform(
+        self,
+        strip,
+        transform_name,
+        keyframes,
+        curve="linear",
+    ):
+        """
+        Apply a single declared transform (with its curve) to `strip`.
+
+        `curve` is one of:
+
+            "linear"   -> LINEAR   (Blender default)
+            "constant" -> CONSTANT (hold previous value, jump at keyframe)
+            "bezier"   -> BEZIER   (smooth bezier)
+
+        For karaoke-style word highlighting, use "constant" so Blender
+        holds the previous color exactly and jumps instantly to the
+        next one with no fading.
+
+        Returns a tuple: (applied_count, failed_count)
+        """
+        transform_name = str(transform_name).strip().lower()
+
+        curve_key = str(curve).strip().lower()
+
+        if curve_key not in INTERPOLATION_MAP:
+            curve_key = "linear"
+
+        interpolation = INTERPOLATION_MAP[curve_key]
+
+        appliers = {
+            "translate_x": self._apply_translate_x_keyframe,
+            "translate_y": self._apply_translate_y_keyframe,
+            "scale_x": self._apply_scale_x_keyframe,
+            "scale_y": self._apply_scale_y_keyframe,
+            "rotation": self._apply_rotation_keyframe,
+            "color": self._apply_color_keyframe,
+        }
+
+        applier = appliers.get(transform_name)
+
+        if applier is None:
+            self.log.warning(
+                f"[TRANSFORM] Unsupported property "
+                f"'{transform_name}' on strip '{strip.name}'."
+            )
+            return 0, 0
+
+        if not isinstance(keyframes, list):
+            self.log.warning(
+                f"[TRANSFORM] Expected list of keyframes for "
+                f"'{transform_name}' on strip '{strip.name}', "
+                f"got {type(keyframes).__name__}."
+            )
+            return 0, 0
+
+        applied = 0
+        failed = 0
+
+        for keyframe in keyframes:
+
+            if not isinstance(keyframe, dict):
+                self.log.warning(
+                    f"[TRANSFORM] Invalid keyframe for "
+                    f"'{transform_name}' on strip '{strip.name}': "
+                    f"{keyframe!r}"
+                )
+                failed += 1
+                continue
+
+            t = keyframe.get("t")
+
+            if t is None:
+                self.log.warning(
+                    f"[TRANSFORM] Keyframe has no 't' "
+                    f"for property '{transform_name}' "
+                    f"on strip '{strip.name}'."
+                )
+                failed += 1
+                continue
+
+            if "value" not in keyframe:
+                self.log.warning(
+                    f"[TRANSFORM] Keyframe has no 'value' "
+                    f"for property '{transform_name}' "
+                    f"on strip '{strip.name}'."
+                )
+                failed += 1
+                continue
+
+            value = keyframe.get("value")
+
+            try:
+                frame = self._resolve_transform_time(t)
+
+                success = applier(
+                    strip=strip,
+                    frame=frame,
+                    value=value,
+                    interpolation=interpolation,
+                )
+
+                if success:
+                    applied += 1
+
+                    self.log.info(
+                        f"[TRANSFORM] "
+                        f"{strip.name} "
+                        f"{transform_name}={value!r} "
+                        f"frame={frame} "
+                        f"curve={curve_key}"
+                    )
+                else:
+                    failed += 1
+
+            except Exception as exc:
+                failed += 1
+
+                self.log.error(
+                    f"[TRANSFORM] Failed applying "
+                    f"{transform_name}={value!r} "
+                    f"to '{strip.name}': {exc}"
+                )
+
+        return applied, failed
+
+    def _apply_declared_transforms(
+        self,
+        clip,
+        target_strip=None,
+    ):
+        """
+        Apply every declared transform belonging to `clip`.
+
+        IMPORTANT:
+
+        This method does NOT create a transform effect strip.
+
+        `target_strip` is the actual VSE strip produced from the clip.
+
+        Each transform value is first normalized via
+        `_normalize_transform` so it accepts BOTH shapes:
+
+            "color": [ { "t": ..., "value": ... }, ... ]
+
+            "color": {
+                "curve": "constant",
+                "keyframes": [ { "t": ..., "value": ... }, ... ]
+            }
+
+        Then `_apply_transform` is called with the resolved curve
+        so that Blender's keyframe interpolation is set correctly
+        (LINEAR / CONSTANT / BEZIER).
+
+        Example:
+
+            clip
+              |
+              +-- transforms
+              |
+              v
+            TEXT strip
+
+        or:
+
+            clip
+              |
+              +-- transforms
+              |
+              v
+            MOVIE strip
+        """
+        if not clip:
+            return target_strip
+
+        transforms = self._get_declared_transforms(clip)
+
+        if not transforms:
+            return target_strip
+
+        clip_id = clip.get("_id")
+
+        # If the caller didn't explicitly provide the target, resolve
+        # it from the compiled strip map.
+        if target_strip is None and clip_id:
+            target_strip = self.strips.get(clip_id)
+
+        if target_strip is None:
+
+            self.log.error(
+                f"[TRANSFORM] No target strip available for "
+                f"clip '{clip_id}'."
+            )
+            return None
+
+        self.log.info(
+            f"[TRANSFORM] Applying declared transforms "
+            f"clip={clip_id} target={target_strip.name}"
+        )
+
+        total_applied = 0
+        total_failed = 0
+
+        for property_name, transform_data in transforms.items():
+
+            normalized = self._normalize_transform(
+                transform_data,
+            )
+
+            curve = normalized["curve"]
+            keyframes = normalized["keyframes"]
+
+            applied, failed = self._apply_transform(
+                strip=target_strip,
+                transform_name=property_name,
+                keyframes=keyframes,
+                curve=curve,
+            )
+
+            total_applied += applied
+            total_failed += failed
+
+        # Keep useful metadata on the target strip.
+        try:
+            target_strip["declared_transforms"] = json.dumps(
+                transforms,
+                default=str,
+            )
+        except Exception:
+            pass
+
+        target_strip["has_declared_transforms"] = bool(total_applied)
+
+        self.log.info(
+            f"[TRANSFORM] Completed clip={clip_id} "
+            f"target={target_strip.name} "
+            f"applied={total_applied} failed={total_failed}"
+        )
+
+        return target_strip
 
     # =========================================================================
     # MAIN BUILD
@@ -2363,6 +3273,7 @@ class VSEBuilder(Vse_renderer):
         self._image_counter = 0
         self._text_counter = 0
         self._probe_counter = 0
+        self._effect_counter = 0
 
         self.strips = {}
 
@@ -2378,11 +3289,13 @@ class VSEBuilder(Vse_renderer):
 
         self._probe_failures = set()
 
+        self._transform_effects = {}
+
         self.resolving_media = False
 
-        # ---------------------------------------------------------------------
-        # TIMELINE RESOLVER
-        # ---------------------------------------------------------------------
+        self.channel_allocator = (
+            ChannelAllocator()
+        )
 
         self.timeline_resolver = (
             TimelineResolver(
@@ -2398,10 +3311,6 @@ class VSEBuilder(Vse_renderer):
             self.timeline_resolver
         )
 
-        # ---------------------------------------------------------------------
-        # CLEAR VSE
-        # ---------------------------------------------------------------------
-
         self._clear_sequencer()
 
         tracks = seq.get(
@@ -2409,9 +3318,9 @@ class VSEBuilder(Vse_renderer):
             [],
         )
 
-        # =====================================================================
-        # BUILD CLIP INDEX
-        # =====================================================================
+        # ---------------------------------------------------------------------
+        # INDEX ALL CLIPS
+        # ---------------------------------------------------------------------
 
         self.log.info(
             "[BUILD] INDEXING ALL CLIPS"
@@ -2442,15 +3351,10 @@ class VSEBuilder(Vse_renderer):
                 if not clip_id:
 
                     clip_id = (
-                        f"{track_id}-clip-"
-                        f"{clip_index}"
+                        f"{track_id}-clip-{clip_index}"
                     )
 
                     clip["_id"] = clip_id
-
-                # -------------------------------------------------------------
-                # Store by ID.
-                # -------------------------------------------------------------
 
                 self._clips_by_id[
                     clip_id
@@ -2460,21 +3364,12 @@ class VSEBuilder(Vse_renderer):
                     clip_id
                 ] = track
 
-                self.log.info(
-                    f"[BUILD] Indexed clip "
-                    f"{clip_id} "
-                    f"track={track_id}"
-                )
-
-        # =====================================================================
-        # PASS 1
-        #
-        # Register EVERYTHING with TimelineResolver.
-        # =====================================================================
+        # ---------------------------------------------------------------------
+        # PASS 1 - REGISTER
+        # ---------------------------------------------------------------------
 
         self.log.info(
-            "[BUILD] PASS 1 - registering "
-            "tracks and clips"
+            "[BUILD] PASS 1 - registering tracks and clips"
         )
 
         for index, track in enumerate(
@@ -2500,11 +3395,8 @@ class VSEBuilder(Vse_renderer):
                     track_id,
                 )
 
-            if (
-                self._locked_channels(
-                    track
-                )
-                is None
+            if not self._is_positionable_track(
+                track
             ):
 
                 self.log.info(
@@ -2514,23 +3406,13 @@ class VSEBuilder(Vse_renderer):
                     f"registered only"
                 )
 
-        # =====================================================================
-        # PASS 2
-        #
-        # Resolve media and probe native durations.
-        #
-        # IMPORTANT:
-        #
-        # We probe EVERY registered clip.
-        #
-        # Previously this loop skipped tracks without locked channels. That
-        # meant TimelineResolver could later request a duration for a clip
-        # which had never been probed.
-        # =====================================================================
+        # ---------------------------------------------------------------------
+        # PASS 2 - RESOLVE MEDIA + PROBE
+        # ---------------------------------------------------------------------
 
         self.log.info(
-            "[BUILD] PASS 2 - resolving "
-            "media and probing durations"
+            "[BUILD] PASS 2 - resolving media "
+            "and probing durations"
         )
 
         self.update_server_status(
@@ -2552,21 +3434,12 @@ class VSEBuilder(Vse_renderer):
 
         self._purge_stray_probe_strips()
 
-        self.log.info(
-            f"[BUILD] Probed "
-            f"{len(self._native_durations)} "
-            f"clip durations."
-        )
-
-        # =====================================================================
-        # PASS 3
-        #
-        # Resolve complete editorial timeline.
-        # =====================================================================
+        # ---------------------------------------------------------------------
+        # PASS 3 - RESOLVE EDITORIAL TIMELINE
+        # ---------------------------------------------------------------------
 
         self.log.info(
-            "[BUILD] PASS 3 - resolving "
-            "editorial timeline"
+            "[BUILD] PASS 3 - resolving editorial timeline"
         )
 
         self.update_server_status(
@@ -2575,65 +3448,109 @@ class VSEBuilder(Vse_renderer):
 
         self.timeline_resolver.resolve_timeline()
 
-        # =====================================================================
-        # PASS 4
-        #
-        # Materialize TEXT.
-        # =====================================================================
+        # ---------------------------------------------------------------------
+        # PASS 4 - MATERIALIZE TEXT
+        # ---------------------------------------------------------------------
 
         self.log.info(
-            "[BUILD] PASS 4 - materializing "
-            "text"
+            "[BUILD] PASS 4 - materializing text"
         )
 
         self._materialize_text_clips(
             tracks
         )
 
-        # =====================================================================
-        # PASS 5
+        # ---------------------------------------------------------------------
+        # PASS 5 - MATERIALIZE MEDIA
         #
-        # Materialize all real media strips.
-        #
-        # Every strip is created exactly once at its final position/channel.
-        # =====================================================================
+        # Declared transforms are applied inline, immediately after each
+        # clip's actual VSE strip is created (see
+        # `_materialize_resolved_clip` and `_create_text_strip`). There is
+        # no separate global transform pass: a transform is applied
+        # directly to the strip that already exists for its clip, so no
+        # standalone TRANSFORM effect strip is ever created.
+        # ---------------------------------------------------------------------
 
         self.log.info(
-            "[BUILD] PASS 5 - materializing "
-            "media"
+            "[BUILD] PASS 5 - materializing media "
+            "(priority sorted)"
         )
 
         self.update_server_status(
             "BUILDING_VSE"
         )
 
+        materializable = []
+
         for track in tracks:
 
-            if (
-                self._locked_channels(
-                    track
-                )
-                is None
+            if not self._is_positionable_track(
+                track
             ):
-
                 continue
+
+            role = self._assign_track_role(
+                track
+            )
+
+            weight = ROLE_WEIGHT.get(
+                role,
+                0,
+            )
 
             for clip in track.get(
                 "clips",
                 [],
             ):
 
-                self._materialize_resolved_clip(
-                    clip,
-                    track,
-                    fps,
+                media = (
+                    clip.get(
+                        "_resolved_media"
+                    )
+                    or {}
                 )
 
-        # ---------------------------------------------------------------------
-        # FINISH
-        # ---------------------------------------------------------------------
+                media_type = media.get(
+                    "media_type"
+                )
+
+                if media_type in {
+                    "text",
+                    "scene",
+                }:
+
+                    continue
+
+                materializable.append(
+                    (
+                        weight,
+                        clip,
+                        track,
+                    )
+                )
+
+        materializable.sort(
+            key=lambda t: t[0]
+        )
+
+        for (
+            weight,
+            clip,
+            track,
+        ) in materializable:
+
+            self._materialize_resolved_clip(
+                clip,
+                track,
+                fps,
+            )
+
         self._purge_stray_probe_strips()
-        
+
+        # ---------------------------------------------------------------------
+        # FINALIZE
+        # ---------------------------------------------------------------------
+
         self.fit_scene_to_timeline()
 
         self.update_server_status(
@@ -2642,8 +3559,7 @@ class VSEBuilder(Vse_renderer):
 
         self.log.info(
             f"VSE build completed. "
-            f"{len(self.strips)} strips "
-            f"materialized."
+            f"{len(self.strips)} strips materialized."
         )
 
     # =========================================================================
@@ -2668,8 +3584,8 @@ class VSEBuilder(Vse_renderer):
         if not media:
 
             self.log.error(
-                f"No resolved media for "
-                f"clip '{clip_id}'"
+                f"No resolved media for clip "
+                f"'{clip_id}'"
             )
 
             return None
@@ -2694,8 +3610,8 @@ class VSEBuilder(Vse_renderer):
         if obj is None:
 
             self.log.error(
-                f"No resolved timing "
-                f"for clip '{clip_id}'"
+                f"No resolved timing for "
+                f"clip '{clip_id}'"
             )
 
             return None
@@ -2753,6 +3669,13 @@ class VSEBuilder(Vse_renderer):
                 f"for clip '{clip_id}'"
             )
 
+        # ---------------------------------------------------------------------
+        # THE IMPORTANT PART
+        #
+        # The actual strip is now registered as the target BEFORE
+        # declared transforms are applied.
+        # ---------------------------------------------------------------------
+
         if (
             strip is not None
             and clip_id
@@ -2761,6 +3684,11 @@ class VSEBuilder(Vse_renderer):
             self.strips[
                 clip_id
             ] = strip
+
+            self._apply_declared_transforms(
+                clip=clip,
+                target_strip=strip,
+            )
 
         return strip
 
@@ -2775,13 +3703,9 @@ class VSEBuilder(Vse_renderer):
 
         for track in tracks:
 
-            if (
-                self._locked_channels(
-                    track
-                )
-                is None
+            if not self._is_positionable_track(
+                track
             ):
-
                 continue
 
             for clip in track.get(
@@ -2796,12 +3720,9 @@ class VSEBuilder(Vse_renderer):
                     or {}
                 )
 
-                if (
-                    media.get(
-                        "media_type"
-                    )
-                    != "text"
-                ):
+                if media.get(
+                    "media_type"
+                ) != "text":
 
                     continue
 
@@ -2867,34 +3788,38 @@ class VSEBuilder(Vse_renderer):
         end_frame,
     ):
 
-        clip_ref = clip.get(
-            "clip_ref",
-            {},
+        clip_ref = (
+            clip.get(
+                "clip_ref",
+                {},
+            )
         )
 
         text = (
-            clip_ref.get(
-                "value"
-            )
-            or clip_ref.get(
-                "text"
-            )
+            clip_ref.get("text")
+            or clip_ref.get("value")
             or "Text strip"
         )
 
-        (
-            video_channel,
-            _,
-        ) = self._resolve_channels(
-            clip,
-            track,
+        duration_frames = (
+            end_frame
+            - start_frame
+        )
+
+        video_channel, _ = (
+            self._resolve_channels(
+                clip,
+                track,
+                start_frame,
+                duration_frames,
+            )
         )
 
         if video_channel is None:
 
             self.log.error(
-                f"No text channel for "
-                f"clip '{clip.get('_id')}'"
+                f"No text channel "
+                f"for clip '{clip.get('_id')}'"
             )
 
             return None
@@ -2942,7 +3867,18 @@ class VSEBuilder(Vse_renderer):
             resolved,
         )
 
+        txt["strip_role"] = "text"
+
         txt.text = text
+
+        # ---------------------------------------------------------------------
+        # APPLY TRANSFORMS TO THIS EXACT TEXT STRIP
+        # ---------------------------------------------------------------------
+
+        self._apply_declared_transforms(
+            clip=clip,
+            target_strip=txt,
+        )
 
         self.log.info(
             f"[CREATE TEXT] "
@@ -3047,9 +3983,11 @@ class VSEBuilder(Vse_renderer):
         return (
             datetime.now(
                 timezone.utc
-            ).isoformat(
+            )
+            .isoformat(
                 timespec="milliseconds"
-            ).replace(
+            )
+            .replace(
                 "+00:00",
                 "Z",
             )
@@ -3109,9 +4047,8 @@ class VSEBuilder(Vse_renderer):
         if not self.generation:
 
             self.log.warning(
-                f"update_server_status "
-                f"skipped ({status}): "
-                f"no generation"
+                f"update_server_status skipped "
+                f"({status}): no generation"
             )
 
             return
@@ -3121,9 +4058,7 @@ class VSEBuilder(Vse_renderer):
             "machine_id",
         ):
 
-            self.machine_id = (
-                "unknown"
-            )
+            self.machine_id = "unknown"
 
         generation_id = (
             self.generation.get(
@@ -3139,8 +4074,7 @@ class VSEBuilder(Vse_renderer):
         }
 
         return self._post_json(
-            f"{self.server_url}/"
-            f"update_generation_status",
+            f"{self.server_url}/update_generation_status",
             payload,
         )
 
@@ -3160,11 +4094,9 @@ class VSEBuilder(Vse_renderer):
             "<unk>",
         )
 
-        description = (
-            self.instruction.get(
-                "description",
-                "",
-            )
+        description = self.instruction.get(
+            "description",
+            "",
         )
 
         user = self.instruction.get(
@@ -3185,15 +4117,12 @@ class VSEBuilder(Vse_renderer):
 
             return None
 
-        total_size = (
-            filepath.stat().st_size
-        )
+        total_size = filepath.stat().st_size
 
         if total_size <= 0:
 
             self.log.error(
-                f"Render file is empty: "
-                f"{filepath}"
+                "Render file is empty"
             )
 
             return None
@@ -3228,19 +4157,24 @@ class VSEBuilder(Vse_renderer):
                     )
                 )
 
-                response = self._post_json(
-                    f"{self.editor_url}/"
-                    f"upload_media",
-                    {
-                        "media_id": media_id,
-                        "chunk": encoded,
-                        "index": index,
-                        "size": len(
-                            chunk_bytes
-                        ),
-                        "total_chunks":
-                            total_chunks,
-                    },
+                response = (
+                    self._post_json(
+                        f"{self.editor_url}/upload_media",
+                        {
+                            "media_id":
+                                media_id,
+                            "chunk":
+                                encoded,
+                            "index":
+                                index,
+                            "size":
+                                len(
+                                    chunk_bytes
+                                ),
+                            "total_chunks":
+                                total_chunks,
+                        },
+                    )
                 )
 
                 if not response.get(
@@ -3250,15 +4184,13 @@ class VSEBuilder(Vse_renderer):
 
                     self.log.error(
                         f"Failed uploading "
-                        f"render chunk "
-                        f"{index}"
+                        f"render chunk {index}"
                     )
 
                     return None
 
         response = self._post_json(
-            f"{self.editor_url}/"
-            f"add_media",
+            f"{self.editor_url}/add_media",
             {
                 "_id": media_id,
                 "title": title,
@@ -3275,15 +4207,12 @@ class VSEBuilder(Vse_renderer):
         ):
 
             self.log.error(
-                "Failed to add "
-                "media metadata"
+                "Failed to add media metadata"
             )
 
             return None
 
-        return response[
-            "data"
-        ]
+        return response["data"]
 
     # =========================================================================
     # GENERATION COMPLETE
@@ -3295,8 +4224,7 @@ class VSEBuilder(Vse_renderer):
     ):
 
         return self._post_json(
-            f"{self.server_url}/"
-            f"generation_complete",
+            f"{self.server_url}/generation_complete",
             {
                 "_id": self.generation.get(
                     "_id"

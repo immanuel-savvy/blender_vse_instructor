@@ -1,0 +1,79 @@
+# VSEBuilder Refactor Plan
+
+## Goal
+
+Break the monolithic `VSEBuilder` god-class into small, single-responsibility
+classes that can be understood, tested, and modified independently, without
+changing behavior.
+
+## Approach
+
+1. **Identify responsibility clusters** in the original class by grouping
+   methods that share the same private state (e.g. everything touching
+   `_native_durations` + probing, everything touching HTTP + `server_url`,
+   everything touching keyframed transform effects).
+2. **Extract one class per cluster**, each taking its dependencies via the
+   constructor (log, sequencer, and other collaborators) rather than reaching
+   into a shared `self`.
+3. **Keep genuinely shared mutable state as shared dict objects** (`strips`,
+   `_clips_by_id`, `_clip_tracks`) passed by reference into the collaborators
+   that need them, and mutate them with `.clear()`/`[key] = value` rather than
+   rebinding — so every collaborator holding a reference sees the same data
+   without needing setters on every `build()` call.
+4. **Give the orchestrator (`VSEBuilder`) only the pipeline**: indexing,
+   registering, and running the build passes in order, delegating all actual
+   work to collaborators.
+5. **Flag but don't silently delete dead code.** Two now-unused transform
+   helper pipelines existed in the original file (expression-based target
+   inference). They aren't called anywhere in `build()`. Kept them under a
+   clearly labeled "LEGACY (currently unused)" section in `TransformManager`
+   instead of deleting, so nothing breaks if something external depends on
+   them — flagged as safe to delete once confirmed unused.
+6. **Verify parity** by syntax-checking every file (`ast.parse`) and running
+   pure-Python smoke tests (no `bpy` required) against the extracted logic:
+   channel allocation/pairing, track role assignment, media-ref resolution
+   heuristics, and transform keyframe normalization.
+7. **Preserve import depth.** New files live in the *same package/directory*
+   as the original `vse_builder.py`, `timeline_resolver.py`, and
+   `vse_renderer.py`, so existing relative imports (`..core.logger`,
+   `.timeline_resolver`, `.vse_renderer`) don't need to change.
+
+## Class Breakdown
+
+| New file | Class | Owns | Key methods |
+|---|---|---|---|
+| `constants.py` | — | Shared constants (cache paths, role weights, track-type map, transform property map, defaults) | — |
+| `channel_allocator.py` | `ChannelAllocator` | Sequencer channel spans per role, occupancy, expansion/push-up logic | `allocate()` |
+| `media_resolver.py` | `MediaResolver` | Turning a `clip_ref` into a filepath: local audio statics, on-disk cache, placeholders, chunked fetch from editor backend | `resolve()`, `is_unresolved_clip_ref()` (static) |
+| `duration_prober.py` | `DurationProber` | Probing/caching native clip durations; lazy duration callback for `TimelineResolver` | `probe_clip()`, `get_clip_duration_ms()`, `purge_stray_probe_strips()` |
+| `track_role_resolver.py` | `TrackRoleResolver` | Track → role mapping (video-main, audio, text, ...) | `assign_role()`, `is_positionable()` (both static/classmethod) |
+| `strip_factory.py` | `StripFactory` | Creating the actual Blender strips (video, audio, image, legacy transform, text) and attaching editorial metadata | `add_video_clip()`, `add_audio_clip()`, `add_image_clip()`, `add_transform_clip()`, `create_text_strip()` |
+| `transform_manager.py` | `TransformManager` | Applying declared keyframed TRANSFORM effects attached to existing strips | `apply_declared_transforms()` (+ legacy unused helpers, clearly marked) |
+| `server_client.py` | `ServerClient` | HTTP: status updates, chunked render upload, generation-complete | `update_generation_status()`, `upload_rendered_media()`, `generation_complete()` |
+| `vse_builder.py` | `VSEBuilder` | Orchestration only: `build()` pipeline (index → register → probe → resolve timeline → materialize text → materialize media → apply transforms → finalize) | `build()` |
+
+## Wiring / Dependency Injection
+
+`VSEBuilder.__init__` constructs every collaborator once and wires them
+together:
+
+- `MediaResolver` gets an `on_start_resolving` callback that calls back into
+  `VSEBuilder.update_server_status("RESOLVING_MEDIA")` — this replaces the
+  original's `if not self.resolving_media: ... self.update_server_status(...)`
+  guard that lived inline in `_resolve_media`.
+- `DurationProber` and `TransformManager` receive the **same dict objects**
+  (`self._clips_by_id`, `self._clip_tracks`, `self.strips`) that `VSEBuilder`
+  owns, so lookups stay in sync without copying.
+- `StripFactory` and `DurationProber` get a `set_timeline()` setter, called
+  once per `build()` after `TimelineResolver` is constructed (the original
+  timeline object doesn't exist yet at `__init__` time).
+- On `_clear_sequencer()`, the new sequencer instance is pushed into every
+  collaborator that holds a `sequencer` reference.
+
+## What to reuse this plan for
+
+Apply the same five steps (cluster → extract → share state by reference →
+slim orchestrator → verify) any time a class like this is asked to be split:
+group by shared private state, not by original method order; keep the
+orchestrator as thin as possible; don't delete code you can't prove is dead,
+just quarantine and label it.
