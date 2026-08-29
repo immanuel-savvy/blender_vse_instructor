@@ -135,6 +135,193 @@ INTERPOLATION_MAP = {
 
 
 # =============================================================================
+# TRANSFORM PROPERTIES
+#
+# Single source of truth for "this friendly name on a clip's
+# `transforms` block maps to this Blender property on the strip,
+# and needs this value conversion before keyframing."
+#
+# Adding a new transform property is a one-line entry here. Every
+# keyframe (regardless of `curve`) automatically goes through
+# `_apply_generic_keyframe` and gets the right interpolation
+# (LINEAR / CONSTANT / BEZIER) applied to every component fcurve
+# of the target property.
+# =============================================================================
+
+
+def _convert_float(value):
+    """Plain float — translate, scale, opacity, etc."""
+    return float(value)
+
+
+def _convert_rotation(value):
+    """JSON in degrees -> Blender radians (sequence rotation)."""
+    return math.radians(float(value))
+
+
+def _convert_color(value):
+    """
+    '#RRGGBB' / '#RRGGBBAA' / 'RRGGBB' / 'RRGGBBAA'
+    -> Blender's normalized RGBA tuple.
+    """
+    if value is None:
+        raise ValueError("Color value cannot be None.")
+
+    text = str(value).strip().lstrip("#")
+
+    if len(text) == 6:
+        text += "ff"
+
+    if len(text) != 8:
+        raise ValueError(
+            f"Invalid color '{value}'. "
+            f"Expected #RRGGBB or #RRGGBBAA."
+        )
+
+    try:
+        return tuple(
+            int(text[i:i + 2], 16) / 255.0
+            for i in range(0, 8, 2)
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid hexadecimal color '{value}'."
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Property registry
+# ---------------------------------------------------------------------------
+#
+# Schema per entry:
+#
+#   "friendly_name": {
+#       "data_path": "<RNA path relative to the strip>",
+#       "requires":  "<attribute that must exist on the strip>",
+#       "convert":   <callable: raw JSON value -> Blender value>,
+#       "description": "<optional human-readable note>",
+#   }
+#
+# `data_path` is what gets passed to `strip.keyframe_insert()` and
+# what the resulting fcurve's data_path ends with. It may be a
+# nested path like "transform.offset_x".
+#
+# `requires` is the top-level attribute we check with hasattr()
+# before touching the property. For "transform.*" paths this is
+# "transform" (the nested object), not the leaf property name —
+# because `hasattr(strip, "transform.offset_x")` is unreliable in
+# Python's hasattr.
+# ---------------------------------------------------------------------------
+
+TRANSFORM_PROPERTY_MAP = {
+
+    # ---- 2D position / scale / rotation ----
+
+    "translate_x": {
+        "data_path": "transform.offset_x",
+        "requires": "transform",
+        "convert": _convert_float,
+        "description": "Horizontal offset in pixels.",
+    },
+    "translate_y": {
+        "data_path": "transform.offset_y",
+        "requires": "transform",
+        "convert": _convert_float,
+        "description": "Vertical offset in pixels.",
+    },
+    "scale_x": {
+        "data_path": "transform.scale_x",
+        "requires": "transform",
+        "convert": _convert_float,
+        "description": "Horizontal scale factor.",
+    },
+    "scale_y": {
+        "data_path": "transform.scale_y",
+        "requires": "transform",
+        "convert": _convert_float,
+        "description": "Vertical scale factor.",
+    },
+    "rotation": {
+        "data_path": "transform.rotation",
+        "requires": "transform",
+        "convert": _convert_rotation,
+        "description": "Rotation in degrees (JSON) -> radians (Blender).",
+    },
+
+    # ---- Opacity (works on every strip type) ----
+
+    "opacity": {
+        "data_path": "blend_alpha",
+        "requires": "blend_alpha",
+        "convert": _convert_float,
+        "description": "Strip opacity 0.0 (transparent) - 1.0 (opaque).",
+    },
+    "blend_alpha": {
+        "data_path": "blend_alpha",
+        "requires": "blend_alpha",
+        "convert": _convert_float,
+        "description": "Alias for 'opacity'.",
+    },
+
+    # ---- Text strip color (RGBA -> 4 component fcurves) ----
+
+    "color": {
+        "data_path": "color",
+        "requires": "color",
+        "convert": _convert_color,
+        "description": (
+            "RGBA color from hex string. Multi-component -> 4 "
+            "fcurves (R,G,B,A) all get the requested curve."
+        ),
+    },
+
+    # ---- Sound strip properties ----
+
+    "volume": {
+        "data_path": "volume",
+        "requires": "volume",
+        "convert": _convert_float,
+        "description": "Audio volume. 1.0 = unity gain.",
+    },
+    "pitch": {
+        "data_path": "pitch",
+        "requires": "pitch",
+        "convert": _convert_float,
+        "description": "Audio pitch shift in semitones.",
+    },
+    "pan": {
+        "data_path": "pan",
+        "requires": "pan",
+        "convert": _convert_float,
+        "description": "Stereo pan. -1.0 = left, 0.0 = center, 1.0 = right.",
+    },
+}
+
+
+def _resolve_nested_attr(obj, dotted_path):
+    """
+    Walk a dotted path on an object, returning the parent object
+    of the final attribute, the final attribute name, and the
+    current value of the final attribute.
+
+    Example:
+        "transform.offset_x" on a strip ->
+            parent = strip.transform, name = "offset_x",
+            current = strip.transform.offset_x
+    """
+    parts = dotted_path.split(".")
+
+    cursor = obj
+    for part in parts[:-1]:
+        cursor = getattr(cursor, part)
+
+    final_name = parts[-1]
+    current = getattr(cursor, final_name)
+
+    return cursor, final_name, current
+
+
+# =============================================================================
 # DYNAMIC CHANNEL ALLOCATOR
 # =============================================================================
 
@@ -2555,41 +2742,6 @@ class VSEBuilder(Vse_renderer):
             f"Unsupported transform time value: {value!r}"
         )
 
-    def _hex_to_rgba(self, value):
-        """
-        Convert:
-
-            #RRGGBB
-            #RRGGBBAA
-            RRGGBB
-            RRGGBBAA
-
-        into Blender's normalized RGBA tuple.
-        """
-        if value is None:
-            raise ValueError("Color value cannot be None.")
-
-        value = str(value).strip().lstrip("#")
-
-        if len(value) == 6:
-            value += "ff"
-
-        if len(value) != 8:
-            raise ValueError(
-                f"Invalid color '{value}'. Expected "
-                f"#RRGGBB or #RRGGBBAA."
-            )
-
-        try:
-            return tuple(
-                int(value[index:index + 2], 16) / 255.0
-                for index in range(0, 8, 2)
-            )
-        except ValueError as exc:
-            raise ValueError(
-                f"Invalid hexadecimal color '{value}'."
-            ) from exc
-
     # -------------------------------------------------------------------------
     # Fcurve lookup
     # -------------------------------------------------------------------------
@@ -2850,151 +3002,84 @@ class VSEBuilder(Vse_renderer):
 
         return True
 
-    def _apply_translate_x_keyframe(
+    def _apply_generic_keyframe(
         self,
         strip,
-        frame,
-        value,
-        interpolation="LINEAR",
-    ):
-        transform = getattr(strip, "transform", None)
-
-        if transform is None:
-            raise ValueError(
-                f"Strip '{strip.name}' has no transform data."
-            )
-
-        transform.offset_x = float(value)
-
-        return self._keyframe_strip_property(
-            strip,
-            "transform.offset_x",
-            frame,
-            interpolation=interpolation,
-        )
-
-    def _apply_translate_y_keyframe(
-        self,
-        strip,
-        frame,
-        value,
-        interpolation="LINEAR",
-    ):
-        transform = getattr(strip, "transform", None)
-
-        if transform is None:
-            raise ValueError(
-                f"Strip '{strip.name}' has no transform data."
-            )
-
-        transform.offset_y = float(value)
-
-        return self._keyframe_strip_property(
-            strip,
-            "transform.offset_y",
-            frame,
-            interpolation=interpolation,
-        )
-
-    def _apply_scale_x_keyframe(
-        self,
-        strip,
-        frame,
-        value,
-        interpolation="LINEAR",
-    ):
-        transform = getattr(strip, "transform", None)
-
-        if transform is None:
-            raise ValueError(
-                f"Strip '{strip.name}' has no transform data."
-            )
-
-        transform.scale_x = float(value)
-
-        return self._keyframe_strip_property(
-            strip,
-            "transform.scale_x",
-            frame,
-            interpolation=interpolation,
-        )
-
-    def _apply_scale_y_keyframe(
-        self,
-        strip,
-        frame,
-        value,
-        interpolation="LINEAR",
-    ):
-        transform = getattr(strip, "transform", None)
-
-        if transform is None:
-            raise ValueError(
-                f"Strip '{strip.name}' has no transform data."
-            )
-
-        transform.scale_y = float(value)
-
-        return self._keyframe_strip_property(
-            strip,
-            "transform.scale_y",
-            frame,
-            interpolation=interpolation,
-        )
-
-    def _apply_rotation_keyframe(
-        self,
-        strip,
-        frame,
-        value,
-        interpolation="LINEAR",
-    ):
-        transform = getattr(strip, "transform", None)
-
-        if transform is None:
-            raise ValueError(
-                f"Strip '{strip.name}' has no transform data."
-            )
-
-        # JSON uses degrees.
-        # Blender stores sequence rotation in radians.
-        transform.rotation = math.radians(float(value))
-
-        return self._keyframe_strip_property(
-            strip,
-            "transform.rotation",
-            frame,
-            interpolation=interpolation,
-        )
-
-    def _apply_color_keyframe(
-        self,
-        strip,
+        transform_name,
         frame,
         value,
         interpolation="LINEAR",
     ):
         """
-        Apply a color keyframe directly to the target strip.
+        Apply ONE keyframe of ONE transform property to a strip,
+        using the property registry (`TRANSFORM_PROPERTY_MAP`).
 
-        This is primarily intended for TEXT strips, which expose
-        `color`.
+        Steps:
+            1. Look up the property spec.
+            2. Verify the strip exposes the required attribute
+               (e.g., `transform` for nested properties).
+            3. Convert the JSON value to the Blender value.
+            4. Walk the dotted data_path and assign.
+            5. Insert the keyframe (which also sets the
+               interpolation on every component fcurve).
         """
-        if not hasattr(strip, "color"):
+        spec = TRANSFORM_PROPERTY_MAP.get(transform_name)
 
+        if spec is None:
             self.log.warning(
-                f"[TRANSFORM] Strip '{strip.name}' does not expose "
-                f"a color property; skipping color keyframe."
+                f"[TRANSFORM] Unknown property "
+                f"'{transform_name}' on strip '{strip.name}'. "
+                f"Add it to TRANSFORM_PROPERTY_MAP if you want it "
+                f"supported. Known properties: "
+                f"{sorted(TRANSFORM_PROPERTY_MAP.keys())}"
             )
             return False
 
-        rgba = self._hex_to_rgba(value)
+        data_path = spec["data_path"]
+        requires = spec.get("requires", data_path)
+        convert = spec.get("convert", lambda v: v)
 
-        strip.color = rgba
+        # ---- 1. Attribute check ------------------------------------
+        # `hasattr` on a dotted path is unreliable, so we always
+        # check the top-level attribute only.
+        if not hasattr(strip, requires):
+            self.log.warning(
+                f"[TRANSFORM] Strip '{strip.name}' has no "
+                f"attribute '{requires}'; cannot keyframe "
+                f"'{transform_name}' ({data_path})."
+            )
+            return False
 
+        # ---- 2. Value conversion -----------------------------------
+        try:
+            converted = convert(value)
+        except Exception as exc:
+            self.log.error(
+                f"[TRANSFORM] Could not convert value "
+                f"{value!r} for '{transform_name}' on "
+                f"strip '{strip.name}': {exc}"
+            )
+            return False
+
+        # ---- 3. Assign on the strip --------------------------------
+        try:
+            parent, attr_name, _ = _resolve_nested_attr(
+                strip,
+                data_path,
+            )
+            setattr(parent, attr_name, converted)
+        except Exception as exc:
+            self.log.error(
+                f"[TRANSFORM] Could not assign "
+                f"{transform_name}={converted!r} to "
+                f"strip '{strip.name}' at {data_path}: {exc}"
+            )
+            return False
+
+        # ---- 4. Insert keyframe + set interpolation ----------------
         return self._keyframe_strip_property(
             strip,
-            "color",
+            data_path,
             frame,
             interpolation=interpolation,
         )
@@ -3019,6 +3104,10 @@ class VSEBuilder(Vse_renderer):
         holds the previous color exactly and jumps instantly to the
         next one with no fading.
 
+        Works for any property registered in TRANSFORM_PROPERTY_MAP.
+        Adding a new property is a one-line entry in that table — no
+        new method needed here.
+
         Returns a tuple: (applied_count, failed_count)
         """
         transform_name = str(transform_name).strip().lower()
@@ -3030,21 +3119,12 @@ class VSEBuilder(Vse_renderer):
 
         interpolation = INTERPOLATION_MAP[curve_key]
 
-        appliers = {
-            "translate_x": self._apply_translate_x_keyframe,
-            "translate_y": self._apply_translate_y_keyframe,
-            "scale_x": self._apply_scale_x_keyframe,
-            "scale_y": self._apply_scale_y_keyframe,
-            "rotation": self._apply_rotation_keyframe,
-            "color": self._apply_color_keyframe,
-        }
-
-        applier = appliers.get(transform_name)
-
-        if applier is None:
+        if transform_name not in TRANSFORM_PROPERTY_MAP:
             self.log.warning(
                 f"[TRANSFORM] Unsupported property "
-                f"'{transform_name}' on strip '{strip.name}'."
+                f"'{transform_name}' on strip '{strip.name}'. "
+                f"Known properties: "
+                f"{sorted(TRANSFORM_PROPERTY_MAP.keys())}"
             )
             return 0, 0
 
@@ -3095,8 +3175,9 @@ class VSEBuilder(Vse_renderer):
             try:
                 frame = self._resolve_transform_time(t)
 
-                success = applier(
+                success = self._apply_generic_keyframe(
                     strip=strip,
+                    transform_name=transform_name,
                     frame=frame,
                     value=value,
                     interpolation=interpolation,
