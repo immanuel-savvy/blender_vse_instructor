@@ -2,6 +2,7 @@ import bpy
 
 from ..core.logger import Logger
 
+import os
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -10,7 +11,11 @@ import json
 import base64
 import math
 import uuid
-import re
+import os
+
+os.environ["SUBTITLE_FONT_PATH"] = (
+    "/Users/mac/Creature/web4/SERVICES/Social_handler/statics/fonts/subtitle-default-font.ttf"
+)
 
 from .timeline_resolver import (
     TimelineResolver,
@@ -273,6 +278,21 @@ TRANSFORM_PROPERTY_MAP = {
             "RGBA color from hex string. Multi-component -> 4 "
             "fcurves (R,G,B,A) all get the requested curve."
         ),
+    },
+
+    # ---- Text strip typography ----
+
+    "font_size": {
+        "data_path": "font_size",
+        "requires": "font_size",
+        "convert": _convert_float,
+        "description": "Text font size in pixels.",
+    },
+    "wrap_width": {
+        "data_path": "wrap_width",
+        "requires": "wrap_width",
+        "convert": _convert_float,
+        "description": "Text wrap width in pixels (0 = no wrap).",
     },
 
     # ---- Sound strip properties ----
@@ -816,6 +836,68 @@ class VSEBuilder(Vse_renderer):
         return f"_probe{self._probe_counter:04d}"
 
     # =========================================================================
+    # SUBTITLE FONT PINNING
+    #
+    # Must point at the exact same file as subtitle_default_font.js's
+    # resolve_font_path() on the Node side. Override with the
+    # SUBTITLE_FONT_PATH environment variable — same name, same meaning,
+    # on both sides — or per-clip via
+    # clip["clip_ref"]["metadata"]["subtitle_font_path"].
+    # =========================================================================
+
+    DEFAULT_SUBTITLE_FONT_PATH = os.environ.get(
+        "SUBTITLE_FONT_PATH",
+        str(Path(__file__).resolve().parent / "fonts" / "subtitle-default-font.ttf"),
+    )
+
+    def _get_subtitle_font(self, font_path):
+        """
+        Load (or reuse an already-loaded) font data-block for `font_path`.
+        Cached per-builder-instance so repeated word-strip creation within
+        one build doesn't reload the file hundreds of times.
+        """
+        if not hasattr(self, "_subtitle_font_cache"):
+            self._subtitle_font_cache = {}
+
+        if font_path in self._subtitle_font_cache:
+            return self._subtitle_font_cache[font_path]
+
+        if not font_path or not Path(font_path).exists():
+            self.log.error(
+                f"[SUBTITLE FONT] Font file not found: '{font_path}'. "
+                f"This text strip will fall back to Blender's built-in "
+                f"font, which will NOT match the Node-side layout "
+                f"geometry — positions/wrapping will drift."
+            )
+            self._subtitle_font_cache[font_path] = None
+            return None
+
+        try:
+            font_data = bpy.data.fonts.load(font_path, check_existing=True)
+            self._subtitle_font_cache[font_path] = font_data
+            return font_data
+        except Exception as exc:
+            self.log.error(f"[SUBTITLE FONT] Failed to load '{font_path}': {exc}")
+            self._subtitle_font_cache[font_path] = None
+            return None
+
+    def _apply_subtitle_font(self, strip, clip):
+        """
+        Assign the pinned subtitle font to a TEXT strip, so Blender
+        renders with the exact file the Node-side layout engine measured
+        against instead of its own opaque built-in default.
+        """
+        clip_ref = clip.get("clip_ref") or {}
+        meta = clip_ref.get("metadata") or {}
+
+        font_path = meta.get("subtitle_font_path") or self.DEFAULT_SUBTITLE_FONT_PATH
+
+        font_data = self._get_subtitle_font(font_path)
+
+        if font_data is not None:
+            strip.font = font_data
+
+    # =========================================================================
     # GENERATION
     # =========================================================================
 
@@ -1152,6 +1234,52 @@ class VSEBuilder(Vse_renderer):
         self.log.info(
             f"Resolving media: {clip_ref}"
         )
+
+        # Visual assets supplied by the timeline are already resolved.  Keep
+        # them out of the legacy cache, chunk-download, and media-server path.
+        if "media" in clip_ref:
+
+            media = clip_ref.get("media") or {}
+            preferred = (
+                media.get("type")
+                or clip_ref.get("preferred_type")
+                or "image"
+            )
+
+            if media.get("exists"):
+
+                filepath = media.get("filepath")
+
+                if filepath and Path(filepath).exists():
+
+                    return {
+                        "filepath": filepath,
+                        "media_type": preferred,
+                        "resolved": True,
+                    }
+
+                self.log.warning(
+                    f"Media file missing: {filepath}"
+                )
+
+            if preferred not in {
+                "video",
+                "audio",
+                "image",
+            }:
+
+                preferred = "image"
+
+            return {
+                "filepath": self._resolve_placeholder(
+                    {
+                        **clip_ref,
+                        "preferred_type": preferred,
+                    }
+                ),
+                "media_type": preferred,
+                "resolved": False,
+            }
 
         preferred = (
             clip_ref.get("preferred_type")
@@ -3951,6 +4079,10 @@ class VSEBuilder(Vse_renderer):
         txt["strip_role"] = "text"
 
         txt.text = text
+
+        # Pin the exact font the Node-side layout engine measured
+        # against — see _apply_subtitle_font for why this matters.
+        self._apply_subtitle_font(txt, clip)
 
         # ---------------------------------------------------------------------
         # APPLY TRANSFORMS TO THIS EXACT TEXT STRIP
