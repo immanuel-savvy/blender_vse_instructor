@@ -2417,6 +2417,11 @@ class VSEBuilder(Vse_renderer):
                 )
             )
 
+            try:
+                bpy.context.view_layer.update()
+            except Exception:
+                pass
+
             self._attach_strip_metadata(
                 video,
                 clip,
@@ -2435,6 +2440,8 @@ class VSEBuilder(Vse_renderer):
                 1,
                 int(duration_frames),
             )
+
+            self._fit_strip_to_output(video)
 
             if audio_channel is not None:
 
@@ -2654,6 +2661,17 @@ class VSEBuilder(Vse_renderer):
                 )
             )
 
+            # Force element metadata to populate so fit can read
+            # orig_width / orig_height (some Blender builds leave
+            # elements empty until the strip is touched).
+            try:
+                if hasattr(image_strip, "elements") and image_strip.elements:
+                    # Touch filename to ensure the image is loaded
+                    _ = image_strip.elements[0].filename
+                bpy.context.view_layer.update()
+            except Exception:
+                pass
+
             self._apply_cut_and_duration(
                 image_strip,
                 clip,
@@ -2663,6 +2681,8 @@ class VSEBuilder(Vse_renderer):
                 1,
                 int(duration_frames),
             )
+
+            self._fit_strip_to_output(image_strip)
 
             self._attach_strip_metadata(
                 image_strip,
@@ -2822,7 +2842,160 @@ class VSEBuilder(Vse_renderer):
             "keyframes": [],
         }
 
-    def _resolve_transform_time(self, value):
+    def _normalize_keyframe_list(self, data):
+        normalized = self._normalize_transform(data)
+        keyframes = []
+        for keyframe in normalized.get("keyframes", []):
+            if not isinstance(keyframe, dict):
+                continue
+            t = keyframe.get("t")
+            value = keyframe.get("value", keyframe.get("v"))
+            if t is not None and value is not None:
+                keyframes.append({"t": t, "value": value})
+        return {
+            "curve": normalized.get("curve", "linear"),
+            "keyframes": keyframes,
+        }
+
+    def _flatten_transforms(self, transforms):
+        if not isinstance(transforms, dict):
+            return {}
+        result = {}
+        for name, data in transforms.items():
+            name = str(name).strip().lower()
+            if name in ("scale", "translate") and isinstance(data, dict):
+                for axis in ("x", "y"):
+                    if axis in data:
+                        result[f"{name}_{axis}"] = self._normalize_keyframe_list(data[axis])
+            else:
+                result[name] = self._normalize_keyframe_list(data)
+        return result
+
+    def _get_strip_source_size(self, strip):
+        """
+        Best-effort native width/height of an IMAGE or MOVIE strip.
+
+        Blender versions differ on where the source resolution lives:
+          - strip.elements[0].orig_width / orig_height  (common)
+          - bpy.data.images[name].size for stills
+          - strip.size / strip.elements fallbacks
+        """
+        src_w = src_h = 0.0
+
+        # 1) Sequence element (IMAGE / MOVIE)
+        try:
+            elements = getattr(strip, "elements", None)
+            if elements:
+                element = elements[0]
+                src_w = float(getattr(element, "orig_width", 0) or 0)
+                src_h = float(getattr(element, "orig_height", 0) or 0)
+        except Exception:
+            pass
+
+        # 2) Still image data-block (IMAGE strips often load into bpy.data.images)
+        if src_w <= 0 or src_h <= 0:
+            try:
+                filepath = getattr(strip, "filepath", None) or ""
+                # new_image stores the path on the element, not always on the strip
+                if not filepath and getattr(strip, "elements", None):
+                    filepath = getattr(strip.elements[0], "filename", "") or ""
+                if filepath:
+                    # Prefer already-loaded image
+                    for img in bpy.data.images:
+                        if img.filepath and Path(img.filepath).name == Path(filepath).name:
+                            if img.size[0] > 0 and img.size[1] > 0:
+                                src_w = float(img.size[0])
+                                src_h = float(img.size[1])
+                                break
+                    if (src_w <= 0 or src_h <= 0) and Path(filepath).exists():
+                        img = bpy.data.images.load(filepath, check_existing=True)
+                        if img and img.size[0] > 0 and img.size[1] > 0:
+                            src_w = float(img.size[0])
+                            src_h = float(img.size[1])
+            except Exception as exc:
+                self.log.warning(
+                    f"[FIT] Image size probe failed for "
+                    f"'{getattr(strip, 'name', '?')}': {exc}"
+                )
+
+        # 3) Last-resort: some movie strips expose .size as a 2-tuple
+        if src_w <= 0 or src_h <= 0:
+            try:
+                size = getattr(strip, "size", None)
+                if size and len(size) >= 2:
+                    src_w = float(size[0] or 0)
+                    src_h = float(size[1] or 0)
+            except Exception:
+                pass
+
+        return src_w, src_h
+
+    def _fit_strip_to_output(self, strip):
+        """
+        Uniformly scale the strip so it fits inside the output resolution
+        while preserving aspect ratio, then center it.
+
+        Stores the applied base scale on the strip as strip["fit_scale"]
+        so declared Ken-Burns / scale keyframes can be applied *relative*
+        to this base instead of overwriting it.
+        """
+        if strip is None or not hasattr(strip, "transform"):
+            return 1.0
+
+        scene = bpy.context.scene
+        out_w = float(getattr(scene.render, "resolution_x", 0) or 0)
+        out_h = float(getattr(scene.render, "resolution_y", 0) or 0)
+
+        if out_w <= 0 or out_h <= 0:
+            self.log.warning(
+                f"[FIT] Output resolution is {out_w}x{out_h}; "
+                f"cannot fit strip '{getattr(strip, 'name', '?')}'."
+            )
+            try:
+                strip["fit_scale"] = 1.0
+            except Exception:
+                pass
+            return 1.0
+
+        src_w, src_h = self._get_strip_source_size(strip)
+
+        if src_w <= 0 or src_h <= 0:
+            self.log.warning(
+                f"[FIT] Could not determine source size for "
+                f"'{getattr(strip, 'name', '?')}' "
+                f"(got {src_w}x{src_h}). Leaving scale at 1.0."
+            )
+            try:
+                strip["fit_scale"] = 1.0
+            except Exception:
+                pass
+            return 1.0
+
+        # Letterbox / pillarbox fit (never crop)
+        scale = min(out_w / src_w, out_h / src_h)
+
+        strip.transform.scale_x = scale
+        strip.transform.scale_y = scale
+        strip.transform.offset_x = 0.0
+        strip.transform.offset_y = 0.0
+
+        try:
+            strip["fit_scale"] = float(scale)
+            strip["source_width"] = float(src_w)
+            strip["source_height"] = float(src_h)
+        except Exception:
+            pass
+
+        self.log.info(
+            f"[FIT] {getattr(strip, 'name', '?')} "
+            f"src={src_w:.0f}x{src_h:.0f} "
+            f"out={out_w:.0f}x{out_h:.0f} "
+            f"scale={scale:.4f}"
+        )
+
+        return scale
+
+    def _resolve_transform_time(self, value, clip=None, strip=None):
         """
         Resolve a transform keyframe time into a Blender frame.
 
@@ -2830,14 +3003,15 @@ class VSEBuilder(Vse_renderer):
 
             12
             12.0
-
+            "0%" / "100%"          (relative to the clip/strip duration)
             {
                 "type": "expression",
                 "value": "scene:abc:start + 2.5"
             }
 
-        The expression is resolved by TimelineResolver, exactly like
-        normal clip start/end expressions.
+        Percentage times prefer the *strip's* own frame range when the
+        strip already exists (most reliable), then fall back to the
+        TimelineResolver timing object.
         """
         if value is None:
             raise TimelineResolutionError(
@@ -2848,15 +3022,63 @@ class VSEBuilder(Vse_renderer):
         if isinstance(value, (int, float)):
             return int(round(value))
 
+        if isinstance(value, str) and value.strip().endswith("%"):
+            try:
+                percentage = float(value.strip()[:-1]) / 100.0
+            except ValueError:
+                raise TimelineResolutionError(
+                    f"Bad percentage transform time: {value!r}"
+                )
+
+            # 1) Prefer the strip that already has final timing.
+            if strip is not None:
+                try:
+                    start_f = int(getattr(strip, "frame_final_start", 0) or 0)
+                    dur_f = int(getattr(strip, "frame_final_duration", 0) or 0)
+                    if dur_f > 0:
+                        # At 100% land on the last frame of the strip
+                        # (frame_final_end is exclusive in Blender).
+                        frame = start_f + int(round(percentage * max(dur_f - 1, 0)))
+                        self.log.info(
+                            f"[TRANSFORM TIME] {value!r} via strip "
+                            f"start={start_f} dur={dur_f} -> frame={frame}"
+                        )
+                        return frame
+                except Exception as exc:
+                    self.log.warning(
+                        f"[TRANSFORM TIME] Strip-based % resolve failed: {exc}"
+                    )
+
+            # 2) TimelineResolver timing object
+            if clip is not None and self.timeline is not None:
+                timing = self.timeline.clips.get(clip.get("_id"))
+                if timing is not None:
+                    start_ms = getattr(timing, "start", None)
+                    dur_ms = getattr(timing, "duration", None)
+                    if start_ms is None:
+                        start_ms = getattr(timing, "start_ms", 0) or 0
+                    if dur_ms is None:
+                        dur_ms = getattr(timing, "duration_ms", 0) or 0
+                    milliseconds = float(start_ms) + percentage * float(dur_ms)
+                    frame = int(self.timeline.ms_to_frames(milliseconds))
+                    self.log.info(
+                        f"[TRANSFORM TIME] {value!r} via timeline "
+                        f"start_ms={start_ms} dur_ms={dur_ms} -> frame={frame}"
+                    )
+                    return frame
+
+            raise TimelineResolutionError(
+                f"Percentage transform time {value!r} could not be resolved "
+                f"(no strip bounds and no timeline timing for "
+                f"clip={clip.get('_id') if clip else None!r})."
+            )
+
         if self.timeline is None:
             raise TimelineResolutionError(
                 "Cannot resolve transform time before timeline exists."
             )
 
         # A full timing object, e.g. {"type": "expression", "value": "..."}.
-        # Pass it through untouched so TimelineResolver.resolve_ms() can
-        # dispatch on its own "type" field (this is what "expression",
-        # "percentage", "reference", etc. all need).
         if isinstance(value, dict):
             milliseconds = self.timeline.resolve_ms(value)
             return int(self.timeline.ms_to_frames(milliseconds))
@@ -2911,13 +3133,17 @@ class VSEBuilder(Vse_renderer):
 
         matches = []
 
+        leaf = data_path.split(".")[-1]
+
         for fc in action.fcurves:
-            if strip_name not in fc.data_path:
+            path = fc.data_path
+            if strip_name not in path:
                 continue
-            # Require a "." before the property name so we don't
-            # accidentally match "wrap_color" or "bgcolor" when
-            # looking for "color".
-            if not fc.data_path.endswith(f".{data_path}"):
+            if not (
+                path.endswith(f".{data_path}")
+                or path.endswith(f".transform.{leaf}")
+                or path.endswith(f".{leaf}")
+            ):
                 continue
             matches.append(fc)
 
@@ -3057,6 +3283,28 @@ class VSEBuilder(Vse_renderer):
 
         return modified
 
+    def _ensure_scene_action(self):
+        """
+        Sequence-strip keyframes live on the *scene* action.
+        Create animation_data + action if missing so keyframe_insert
+        does not silently fail.
+        """
+        scene = bpy.context.scene
+        if scene is None:
+            return False
+
+        if scene.animation_data is None:
+            scene.animation_data_create()
+
+        if scene.animation_data.action is None:
+            action_name = "VSE_Transforms"
+            action = bpy.data.actions.get(action_name)
+            if action is None:
+                action = bpy.data.actions.new(name=action_name)
+            scene.animation_data.action = action
+
+        return True
+
     def _keyframe_strip_property(
         self,
         strip,
@@ -3080,15 +3328,35 @@ class VSEBuilder(Vse_renderer):
         if interpolation not in {"LINEAR", "CONSTANT", "BEZIER"}:
             interpolation = "LINEAR"
 
+        if not self._ensure_scene_action():
+            self.log.error(
+                "[TRANSFORM] No scene available for keyframing."
+            )
+            return False
+
+        # Transform properties belong to the strip's nested transform RNA
+        # object. Keep the original path for f-curve matching below.
+        target = strip
+        insert_path = data_path
+        if data_path.startswith("transform."):
+            if not hasattr(strip, "transform") or strip.transform is None:
+                self.log.error(
+                    f"[TRANSFORM] Strip '{getattr(strip, 'name', '?')}' "
+                    f"has no transform; cannot keyframe '{data_path}'."
+                )
+                return False
+            target = strip.transform
+            insert_path = data_path.split(".", 1)[1]
+
         try:
             if index is None:
-                strip.keyframe_insert(
-                    data_path=data_path,
+                target.keyframe_insert(
+                    data_path=insert_path,
                     frame=frame,
                 )
             else:
-                strip.keyframe_insert(
-                    data_path=data_path,
+                target.keyframe_insert(
+                    data_path=insert_path,
                     index=index,
                     frame=frame,
                 )
@@ -3098,7 +3366,7 @@ class VSEBuilder(Vse_renderer):
             self.log.error(
                 f"[TRANSFORM] Failed keyframe_insert "
                 f"strip={getattr(strip, 'name', '<unknown>')} "
-                f"path={data_path} "
+                f"path={data_path} (insert_path={insert_path}) "
                 f"index={index} "
                 f"frame={frame}: {exc}"
             )
@@ -3147,8 +3415,11 @@ class VSEBuilder(Vse_renderer):
             2. Verify the strip exposes the required attribute
                (e.g., `transform` for nested properties).
             3. Convert the JSON value to the Blender value.
-            4. Walk the dotted data_path and assign.
-            5. Insert the keyframe (which also sets the
+            4. For scale_x / scale_y: multiply by the fit base scale
+               so Ken-Burns (1.0 → 1.05) is relative to the
+               output-fit size instead of overwriting it.
+            5. Walk the dotted data_path and assign.
+            6. Insert the keyframe (which also sets the
                interpolation on every component fcurve).
         """
         spec = TRANSFORM_PROPERTY_MAP.get(transform_name)
@@ -3189,6 +3460,19 @@ class VSEBuilder(Vse_renderer):
             )
             return False
 
+        # ---- 2b. Relative scale on top of fit-to-output ------------
+        # Editorial scale keyframes are authored as 1.0 → 1.05
+        # (Ken Burns). Fit-to-output already set transform.scale_*
+        # to e.g. 0.42 so the image fills 1920x1080 without
+        # cropping. Absolute keyframes would wipe that. Multiply
+        # by the stored fit base instead.
+        if transform_name in ("scale_x", "scale_y"):
+            try:
+                fit_base = float(strip.get("fit_scale", 1.0) or 1.0)
+            except Exception:
+                fit_base = 1.0
+            converted = float(converted) * fit_base
+
         # ---- 3. Assign on the strip --------------------------------
         try:
             parent, attr_name, _ = _resolve_nested_attr(
@@ -3218,6 +3502,7 @@ class VSEBuilder(Vse_renderer):
         transform_name,
         keyframes,
         curve="linear",
+        clip=None,
     ):
         """
         Apply a single declared transform (with its curve) to `strip`.
@@ -3289,19 +3574,24 @@ class VSEBuilder(Vse_renderer):
                 failed += 1
                 continue
 
-            if "value" not in keyframe:
+            # Accept both editorial "v" and canonical "value"
+            if "value" not in keyframe and "v" not in keyframe:
                 self.log.warning(
-                    f"[TRANSFORM] Keyframe has no 'value' "
+                    f"[TRANSFORM] Keyframe has no 'value'/'v' "
                     f"for property '{transform_name}' "
                     f"on strip '{strip.name}'."
                 )
                 failed += 1
                 continue
 
-            value = keyframe.get("value")
+            value = keyframe.get("value", keyframe.get("v"))
 
             try:
-                frame = self._resolve_transform_time(t)
+                frame = self._resolve_transform_time(
+                    t,
+                    clip=clip,
+                    strip=strip,
+                )
 
                 success = self._apply_generic_keyframe(
                     strip=strip,
@@ -3384,12 +3674,28 @@ class VSEBuilder(Vse_renderer):
         if not clip:
             return target_strip
 
-        transforms = self._get_declared_transforms(clip)
-
-        if not transforms:
-            return target_strip
+        raw = self._get_declared_transforms(clip)
+        transforms = self._flatten_transforms(raw)
 
         clip_id = clip.get("_id")
+
+        if not raw:
+            self.log.info(
+                f"[TRANSFORM] No transforms declared on clip '{clip_id}'."
+            )
+            return target_strip
+
+        self.log.info(
+            f"[TRANSFORM] Raw transforms for clip '{clip_id}': "
+            f"{list(raw.keys())} -> flattened {list(transforms.keys())}"
+        )
+
+        if not transforms:
+            self.log.warning(
+                f"[TRANSFORM] Flatten produced empty map from raw "
+                f"{list(raw.keys())} on clip '{clip_id}'."
+            )
+            return target_strip
 
         # If the caller didn't explicitly provide the target, resolve
         # it from the compiled strip map.
@@ -3406,7 +3712,10 @@ class VSEBuilder(Vse_renderer):
 
         self.log.info(
             f"[TRANSFORM] Applying declared transforms "
-            f"clip={clip_id} target={target_strip.name}"
+            f"clip={clip_id} target={target_strip.name} "
+            f"fit_scale={target_strip.get('fit_scale', 1.0)!r} "
+            f"strip_frames={getattr(target_strip, 'frame_final_start', '?')}-"
+            f"{getattr(target_strip, 'frame_final_end', '?')}"
         )
 
         total_applied = 0
@@ -3414,18 +3723,35 @@ class VSEBuilder(Vse_renderer):
 
         for property_name, transform_data in transforms.items():
 
+            # transform_data is already {curve, keyframes} from flatten;
+            # re-normalize is idempotent and keeps a single code path.
             normalized = self._normalize_transform(
                 transform_data,
             )
 
+            # If flatten already returned the unified shape, prefer its
+            # keyframes directly (avoids empty list when "keyframes"
+            # key is present but nested oddly).
+            if isinstance(transform_data, dict) and transform_data.get("keyframes"):
+                normalized = {
+                    "curve": transform_data.get("curve", "linear"),
+                    "keyframes": transform_data["keyframes"],
+                }
+
             curve = normalized["curve"]
             keyframes = normalized["keyframes"]
+
+            self.log.info(
+                f"[TRANSFORM] property={property_name} "
+                f"curve={curve} n_keyframes={len(keyframes)}"
+            )
 
             applied, failed = self._apply_transform(
                 strip=target_strip,
                 transform_name=property_name,
                 keyframes=keyframes,
                 curve=curve,
+                clip=clip,
             )
 
             total_applied += applied
@@ -3472,6 +3798,13 @@ class VSEBuilder(Vse_renderer):
         scene.render.fps_base = 1.0
 
         self.fps = fps
+
+        self.setup_timeline_from_output(
+            seq.get(
+                "output_preset",
+                {},
+            )
+        )
 
         # ---------------------------------------------------------------------
         # RESET BUILD STATE
