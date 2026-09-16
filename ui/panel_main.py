@@ -1,6 +1,5 @@
 import bpy
-from bpy.types import Panel
-from bpy.types import PropertyGroup
+from bpy.types import Panel, PropertyGroup
 from bpy.props import StringProperty
 # -------------------------------
 # UI Panel
@@ -23,14 +22,15 @@ class VSE_INSTRUCTOR_PT_MainPanel(Panel):
     bl_category = "VSE Instructor"
 
     def draw(self, context):
-      prop = context.scene.vse_instructor_props
-      layout = self.layout
-      layout.label(text="Select Instruction") 
-      layout.prop(prop, 'file_path')
+                prop = context.scene.vse_instructor_props
+                layout = self.layout
 
-      layout.operator("vse_instructor.import_instruction", text='Load Instruction')  
-
-      layout.operator('vse_instructor.apply_instruction', text='Apply')
-
-      layout.operator('vse_instructor.render_sequence', text='Render')
+                box = layout.box()
+                box.label(text="Instruction")
+                box.prop(prop, "file_path")
+                row = box.row(align=True)
+                row.operator("vse_instructor.import_instruction", text="Load")
+                row.operator("vse_instructor.apply_instruction", text="Apply")
+                row.operator("vse_instructor.render_sequence", text="Render")
+                box.operator("vse_instructor.upload_render", text="Upload last render")
       

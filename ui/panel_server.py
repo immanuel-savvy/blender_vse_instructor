@@ -9,20 +9,21 @@ def connection_status_update(self, context):
         if area.type == 'SEQUENCE_EDITOR':
             area.tag_redraw()
 
+
 class VSEServerLogLine(PropertyGroup):
     text: StringProperty()
 
 class VSEInstructorServerProperties(PropertyGroup):
     server_url: StringProperty(
         name="Server URL",
-        description="Backend server endpoint",
-        default="https://blender-backend.vercel.app"
+        description="Backend used only for polling jobs",
+        default="",
     )
 
     connection_status: StringProperty(
         name="Status",
         description="Server connection status",
-        default="Offline",
+        default="Idle",
         update=connection_status_update
     )
 
@@ -36,6 +37,18 @@ class VSEInstructorServerProperties(PropertyGroup):
         name="Last Message",
         description="Last message from server",
         default=""
+    )
+
+    poll_interval: IntProperty(
+        name="Poll interval (s)",
+        default=60,
+        min=5,
+        max=600,
+    )
+
+    machine_id: StringProperty(
+        name="Machine ID",
+        default="savvy-m1-air-2020",
     )
 
     logs: CollectionProperty(type=VSEServerLogLine)
@@ -57,25 +70,23 @@ class VSE_INSTRUCTOR_PT_ServerPanel(bpy.types.Panel):
 
         layout.label(text="Connection")
         layout.prop(props, "server_url")
+        layout.prop(props, "machine_id")
+        layout.prop(props, "poll_interval")
 
         layout.separator()
         layout.label(text="Server Control")
 
         # Dynamic label
-        op = layout.operator(
+        layout.operator(
             "vse_instructor.server_toggle",
-            text="Stop Server" if props.server_running else "Start Server"
+            text="Stop Polling" if props.server_running else "Start Polling"
         )
 
         row = layout.row()
         row.label(text="Status:")
         row.label(text=props.connection_status)
 
-        # layout.separator()
-        # layout.label(text="Traffic")
-        # layout.label(text=props.traffic_info)
-
         layout.separator()
         layout.label(text="Last Message")
         box = layout.box()
-        box.label(text=props.last_message if props.last_message else "—")
+        box.label(text=props.last_message if props.last_message else "")

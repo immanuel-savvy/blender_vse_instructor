@@ -4,18 +4,10 @@ from ..core.logger import Logger
 
 import os
 from pathlib import Path
-from datetime import datetime, timezone
-
-import urllib.request
 import json
-import base64
 import math
 import uuid
 import os
-
-os.environ["SUBTITLE_FONT_PATH"] = (
-    "/Users/mac/Creature/web4/SERVICES/Social_handler/statics/fonts/subtitle-default-font.ttf"
-)
 
 from .timeline_resolver import (
     TimelineResolver,
@@ -23,6 +15,9 @@ from .timeline_resolver import (
 )
 
 from .vse_renderer import Vse_renderer
+from .callback_client import CallbackClient
+from .asset_resolver import AssetResolver
+from .channel_allocator import ChannelAllocator
 
 
 # =============================================================================
@@ -61,15 +56,6 @@ MEDIA_EXTENSIONS = {
         ".tiff",
     ],
 }
-
-
-# =============================================================================
-# LOCAL STATICS
-# =============================================================================
-
-LOCAL_AUDIO_STATICS = Path(
-    "/Users/mac/Creature/web4/SERVICES/Social_handler/statics/audio"
-)
 
 
 # =============================================================================
@@ -341,371 +327,52 @@ def _resolve_nested_attr(obj, dotted_path):
     return cursor, final_name, current
 
 
-# =============================================================================
-# DYNAMIC CHANNEL ALLOCATOR
-# =============================================================================
-
-class ChannelAllocator:
-    """
-    Expanding-span allocator with real occupancy relocation.
-
-    Rule: when a role needs more channels it expands upward and
-    pushes EVERY higher role (and their already-placed strips)
-    further up. The new span is stored permanently for that role.
-    """
-
-    def __init__(self, max_channel=MAX_PERMANENT_CHANNEL):
-
-        self.max_channel = max_channel
-
-        # role -> (low, high)
-        self.spans = {}
-
-        # channel -> list of (start_frame, end_frame)
-        self.occupancy = {
-            c: []
-            for c in range(1, max_channel + 1)
-        }
-
-        self.preferred = {
-            "music": 1,
-            "sfx": 2,
-            "audio": 3,
-            "video-audio": 4,
-            "video-main": 5,
-            "video-overlay": 7,
-            "transform": 9,
-            "text": 10,
-        }
-
-        self.ordered_roles = sorted(
-            ROLE_WEIGHT.keys(),
-            key=lambda r: ROLE_WEIGHT.get(r, 0),
-        )
-
-    def _overlaps(self, channel, start, end):
-
-        for s, e in self.occupancy.get(channel, []):
-
-            if not (end <= s or start >= e):
-                return True
-
-        return False
-
-    def _get_span(self, role):
-
-        if role not in self.spans:
-
-            base = self.preferred.get(role, 5)
-
-            self.spans[role] = (
-                base,
-                base,
-            )
-
-        return self.spans[role]
-
-    def _set_span(self, role, low, high):
-
-        self.spans[role] = (
-            max(1, low),
-            min(high, self.max_channel),
-        )
-
-    def _find_free(self, low, high, start, end):
-
-        for ch in range(low, high + 1):
-
-            if ch > self.max_channel:
-                break
-
-            if not self._overlaps(
-                ch,
-                start,
-                end,
-            ):
-                return ch
-
+def _sanitize_bpy_value(value, _depth=0):
+    """Convert Blender ID-property wrappers into plain Python values."""
+    if _depth > 25:
         return None
 
-    def _relocate_occupancy(self, from_ch, to_ch):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
 
-        if from_ch == to_ch:
-            return
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict) and not isinstance(value, dict):
+        try:
+            return _sanitize_bpy_value(to_dict(), _depth + 1)
+        except Exception:
+            pass
 
-        if from_ch not in self.occupancy:
-            return
+    to_list = getattr(value, "to_list", None)
+    if callable(to_list) and not isinstance(value, (list, tuple)):
+        try:
+            return _sanitize_bpy_value(to_list(), _depth + 1)
+        except Exception:
+            pass
 
-        intervals = self.occupancy[from_ch]
+    if isinstance(value, dict):
+        return {
+            key: _sanitize_bpy_value(item, _depth + 1)
+            for key, item in value.items()
+        }
 
-        if not intervals:
-            return
+    if isinstance(value, (list, tuple)):
+        return [
+            _sanitize_bpy_value(item, _depth + 1)
+            for item in value
+        ]
 
-        self.occupancy.setdefault(
-            to_ch,
-            [],
-        ).extend(intervals)
+    type_name = type(value).__name__.lower()
+    if any(tag in type_name for tag in ("bpy", "idprop", "property")):
+        return None
 
-        self.occupancy[from_ch] = []
-
-    def _push_higher_roles(self, from_role, amount):
-
-        if amount <= 0:
-            return
-
-        my_w = ROLE_WEIGHT.get(
-            from_role,
-            0,
-        )
-
-        channels_to_move = sorted(
-            [
-                c
-                for c in self.occupancy
-                if c >= 1
-            ],
-            reverse=True,
-        )
-
-        for role in reversed(self.ordered_roles):
-
-            if ROLE_WEIGHT.get(role, 0) <= my_w:
-                continue
-
-            if role not in self.spans:
-                continue
-
-            old_lo, old_hi = self.spans[role]
-
-            new_lo = min(
-                old_lo + amount,
-                self.max_channel,
-            )
-
-            new_hi = min(
-                old_hi + amount,
-                self.max_channel,
-            )
-
-            self.spans[role] = (
-                new_lo,
-                new_hi,
-            )
-
-        for ch in channels_to_move:
-
-            owner = None
-
-            for r, (lo, hi) in self.spans.items():
-
-                if (
-                    lo <= ch <= hi
-                    and ROLE_WEIGHT.get(r, 0) > my_w
-                ):
-                    owner = r
-                    break
-
-            if owner is None:
-                continue
-
-            new_ch = min(
-                ch + amount,
-                self.max_channel,
-            )
-
-            if new_ch != ch:
-
-                self._relocate_occupancy(
-                    ch,
-                    new_ch,
-                )
-
-    def allocate(
-        self,
-        role,
-        start_frame,
-        end_frame,
-        prefer_pair=False,
-    ):
-
-        start = int(start_frame)
-        end = int(end_frame)
-
-        video_ch = None
-        audio_ch = None
-
-        if role in {
-            "video-main",
-            "video-overlay",
-            "text",
-            "transform",
-        }:
-
-            low, high = self._get_span(role)
-
-            video_ch = self._find_free(
-                low,
-                high,
-                start,
-                end,
-            )
-
-            if video_ch is None:
-
-                self._set_span(
-                    role,
-                    low,
-                    high + 1,
-                )
-
-                self._push_higher_roles(
-                    role,
-                    1,
-                )
-
-                low, high = self._get_span(role)
-
-                video_ch = self._find_free(
-                    low,
-                    high,
-                    start,
-                    end,
-                )
-
-            if video_ch is None:
-                video_ch = high
-
-            self.occupancy.setdefault(
-                video_ch,
-                [],
-            ).append(
-                (
-                    start,
-                    end,
-                )
-            )
-
-        if role in {
-            "audio",
-            "sfx",
-            "music",
-        }:
-
-            low, high = self._get_span(role)
-
-            audio_ch = self._find_free(
-                low,
-                high,
-                start,
-                end,
-            )
-
-            if audio_ch is None:
-
-                self._set_span(
-                    role,
-                    low,
-                    high + 1,
-                )
-
-                self._push_higher_roles(
-                    role,
-                    1,
-                )
-
-                low, high = self._get_span(role)
-
-                audio_ch = self._find_free(
-                    low,
-                    high,
-                    start,
-                    end,
-                )
-
-            if audio_ch is None:
-                audio_ch = low
-
-            self.occupancy.setdefault(
-                audio_ch,
-                [],
-            ).append(
-                (
-                    start,
-                    end,
-                )
-            )
-
-        elif prefer_pair and video_ch is not None:
-
-            pair_role = "video-audio"
-
-            if pair_role not in self.spans:
-
-                vlow, _ = self._get_span(role)
-
-                self.spans[pair_role] = (
-                    max(1, vlow - 1),
-                    max(1, vlow - 1),
-                )
-
-            low, high = self._get_span(
-                pair_role,
-            )
-
-            audio_ch = self._find_free(
-                low,
-                high,
-                start,
-                end,
-            )
-
-            if audio_ch is None:
-
-                self._set_span(
-                    pair_role,
-                    low,
-                    high + 1,
-                )
-
-                self._push_higher_roles(
-                    pair_role,
-                    1,
-                )
-
-                low, high = self._get_span(
-                    pair_role,
-                )
-
-                audio_ch = self._find_free(
-                    low,
-                    high,
-                    start,
-                    end,
-                )
-
-            if audio_ch is None:
-                audio_ch = low
-
-            self.occupancy.setdefault(
-                audio_ch,
-                [],
-            ).append(
-                (
-                    start,
-                    end,
-                )
-            )
-
-        return video_ch, audio_ch
+    return value
 
 
 # =============================================================================
 # VSE BUILDER
 # =============================================================================
 
-class VSEBuilder(Vse_renderer):
-
-    server_url = "https://blender-backend.vercel.app"
+class VSEBuilder(CallbackClient, Vse_renderer):
 
     # =========================================================================
     # INITIALIZATION
@@ -723,12 +390,11 @@ class VSEBuilder(Vse_renderer):
             f"Instruction received: {instruction}"
         )
 
-        self.editor_url = (
-            "https://editor-backend-xi.vercel.app"
-        )
-
-        self.server_url = (
-            "https://blender-backend.vercel.app"
+        CallbackClient.__init__(self, instruction, log=self.log)
+        self.resolver = AssetResolver(
+            instruction,
+            log=self.log,
+            extra_headers=self.callback.get("headers") or {},
         )
 
         self.instruction = instruction
@@ -737,8 +403,6 @@ class VSEBuilder(Vse_renderer):
             "sequence",
             instruction,
         )
-
-        self.generation = None
 
         self.resolving_media = False
 
@@ -776,7 +440,7 @@ class VSEBuilder(Vse_renderer):
         self._transform_effects = {}
 
         self.channel_allocator = (
-            ChannelAllocator()
+            ChannelAllocator(max_channel=MAX_PERMANENT_CHANNEL)
         )
 
         if self.sequencer is None:
@@ -838,17 +502,9 @@ class VSEBuilder(Vse_renderer):
     # =========================================================================
     # SUBTITLE FONT PINNING
     #
-    # Must point at the exact same file as subtitle_default_font.js's
-    # resolve_font_path() on the Node side. Override with the
-    # SUBTITLE_FONT_PATH environment variable — same name, same meaning,
-    # on both sides — or per-clip via
-    # clip["clip_ref"]["metadata"]["subtitle_font_path"].
+    # An explicit existing path is supported for offline/manual use. Normal
+    # jobs resolve the font through the sequence asset resolver.
     # =========================================================================
-
-    DEFAULT_SUBTITLE_FONT_PATH = os.environ.get(
-        "SUBTITLE_FONT_PATH",
-        str(Path(__file__).resolve().parent / "fonts" / "subtitle-default-font.ttf"),
-    )
 
     def _get_subtitle_font(self, font_path):
         """
@@ -890,7 +546,18 @@ class VSEBuilder(Vse_renderer):
         clip_ref = clip.get("clip_ref") or {}
         meta = clip_ref.get("metadata") or {}
 
-        font_path = meta.get("subtitle_font_path") or self.DEFAULT_SUBTITLE_FONT_PATH
+        explicit = meta.get("subtitle_font_path")
+        font_path = explicit if explicit and Path(explicit).exists() else None
+        if not font_path:
+            font_id = meta.get("subtitle_font_id") or "subtitle-default-font"
+            filename = meta.get("subtitle_font_filename") or "subtitle-default-font.ttf"
+            resolved = self.resolver.resolve(
+                kind="font",
+                asset_id=font_id,
+                filename=filename,
+                mime="font/ttf",
+            )
+            font_path = str(resolved) if resolved else None
 
         font_data = self._get_subtitle_font(font_path)
 
@@ -908,41 +575,8 @@ class VSEBuilder(Vse_renderer):
         )
 
         self.generation = generation
-
-    # =========================================================================
-    # MEDIA FETCHING
-    # =========================================================================
-
-    def _fetch_chunk_from_server(
-        self,
-        media_id,
-        index,
-    ):
-
-        payload = json.dumps(
-            {
-                "media_id": media_id,
-                "index": index,
-            }
-        ).encode("utf-8")
-
-        req = urllib.request.Request(
-            url=f"{self.editor_url}/read_upload",
-            data=payload,
-            headers={
-                "Content-Type": "application/json"
-            },
-            method="POST",
-        )
-
-        with urllib.request.urlopen(
-            req,
-            timeout=30,
-        ) as res:
-
-            return json.loads(
-                res.read().decode("utf-8")
-            )
+        if hasattr(self, "resolver"):
+            self.resolver.set_generation(generation)
 
     def _infer_extension(self, clip_ref):
 
@@ -994,6 +628,16 @@ class VSEBuilder(Vse_renderer):
 
     def _resolve_local_audio(self, clip_ref):
 
+        media = clip_ref.get("media") or {}
+        media_filepath = media.get("filepath")
+        if media_filepath and Path(media_filepath).exists():
+            return {
+                "filepath": str(Path(media_filepath)),
+                "media_type": "audio",
+                "resolved": True,
+                "clip_ref": {**clip_ref, "type": "audio"},
+            }
+
         media_id = (
             clip_ref.get("_id")
             or clip_ref.get("clip_ref_id")
@@ -1003,32 +647,19 @@ class VSEBuilder(Vse_renderer):
         if not media_id:
             return None
 
-        candidates = [
-            LOCAL_AUDIO_STATICS / f"{media_id}.wav",
-            LOCAL_AUDIO_STATICS / f"{media_id}.mp3",
-            LOCAL_AUDIO_STATICS / f"{media_id}.flac",
-            LOCAL_AUDIO_STATICS / f"{media_id}.ogg",
-            LOCAL_AUDIO_STATICS / f"{media_id}.aac",
-        ]
-
-        for path in candidates:
-
-            if path.exists():
-
-                self.log.info(
-                    f"[LOCAL AUDIO] Resolved "
-                    f"{media_id} -> {path}"
-                )
-
-                return {
-                    "filepath": str(path),
-                    "media_type": "audio",
-                    "resolved": True,
-                    "clip_ref": {
-                        **clip_ref,
-                        "type": "audio",
-                    },
-                }
+        path = self.resolver.resolve(
+            kind="audio",
+            asset_id=media_id,
+            filename=f"{media_id}.wav",
+            mime=clip_ref.get("mime"),
+        )
+        if path:
+            return {
+                "filepath": str(path),
+                "media_type": "audio",
+                "resolved": True,
+                "clip_ref": {**clip_ref, "type": "audio"},
+            }
 
         return None
 
@@ -1143,90 +774,6 @@ class VSEBuilder(Vse_renderer):
         except Exception:
             pass
 
-    def _find_cached_media(self, clip_ref):
-
-        media_id = clip_ref.get("_id")
-
-        if not media_id:
-            return None
-
-        media_dir = (
-            CACHE_ROOT
-            / media_id.replace(":", "_")
-        )
-
-        search_order = []
-
-        preferred = clip_ref.get(
-            "preferred_type"
-        )
-
-        if preferred:
-            search_order.append(preferred)
-
-        for media_type in clip_ref.get(
-            "accepted_types",
-            [],
-        ):
-
-            if media_type not in search_order:
-                search_order.append(media_type)
-
-        explicit_type = clip_ref.get("type")
-
-        if (
-            explicit_type
-            and explicit_type not in search_order
-        ):
-
-            search_order.insert(
-                0,
-                explicit_type,
-            )
-
-        for media_type in search_order:
-
-            for ext in MEDIA_EXTENSIONS.get(
-                media_type,
-                [],
-            ):
-
-                candidate = (
-                    media_dir
-                    / f"final{ext}"
-                )
-
-                if candidate.exists():
-
-                    return {
-                        "filepath": str(candidate),
-                        "media_type": media_type,
-                        "clip_ref": {
-                            **clip_ref,
-                            "type": media_type,
-                        },
-                    }
-
-        if (
-            preferred == "audio"
-            or "audio" in (
-                clip_ref.get(
-                    "accepted_types"
-                )
-                or []
-            )
-            or explicit_type == "audio"
-        ):
-
-            local = self._resolve_local_audio(
-                clip_ref
-            )
-
-            if local:
-                return local
-
-        return None
-
     def _resolve_media(self, clip_ref):
 
         clip_ref = clip_ref or {}
@@ -1270,6 +817,26 @@ class VSEBuilder(Vse_renderer):
 
                 preferred = "image"
 
+            media_id = (
+                clip_ref.get("_id")
+                or clip_ref.get("clip_ref_id")
+                or media.get("_id")
+            )
+            if media_id and preferred in {"video", "audio", "image"}:
+                resolved_path = self.resolver.resolve(
+                    kind=preferred,
+                    asset_id=media_id,
+                    filename=media.get("filename") or clip_ref.get("title"),
+                    mime=media.get("mime") or clip_ref.get("mime"),
+                )
+                if resolved_path:
+                    return {
+                        "filepath": str(resolved_path),
+                        "media_type": preferred,
+                        "resolved": True,
+                        "clip_ref": {**clip_ref, "type": preferred},
+                    }
+
             return {
                 "filepath": self._resolve_placeholder(
                     {
@@ -1306,17 +873,6 @@ class VSEBuilder(Vse_renderer):
             if local:
                 return local
 
-        cached = self._find_cached_media(
-            clip_ref
-        )
-
-        if cached:
-
-            return {
-                **cached,
-                "resolved": True,
-            }
-
         if self._is_unresolved_clip_ref(
             clip_ref
         ):
@@ -1351,207 +907,57 @@ class VSEBuilder(Vse_renderer):
             }
 
         if not self.resolving_media:
-
             self.resolving_media = True
-
-            self.update_server_status(
-                "RESOLVING_MEDIA"
-            )
+            self.update_server_status("RESOLVING_MEDIA")
 
         media_type = clip_ref.get("type")
         media_id = clip_ref.get("_id")
 
         if media_type == "text":
-
             return {
-                "filepath": clip_ref.get(
-                    "text",
-                    "",
-                ),
+                "filepath": clip_ref.get("text", ""),
                 "media_type": "text",
                 "resolved": True,
             }
 
-        if media_type == "scene":
-
+        if media_type in {"scene", "transform"}:
             return {
                 "filepath": None,
-                "media_type": "scene",
-                "resolved": True,
-            }
-
-        if media_type == "transform":
-
-            return {
-                "filepath": None,
-                "media_type": "transform",
-                "resolved": True,
-            }
-
-        if media_type not in {
-            "video",
-            "audio",
-            "image",
-        }:
-
-            self.log.error(
-                f"Unsupported media type: {media_type}"
-            )
-
-            return None
-
-        if not media_id:
-
-            self.log.error(
-                "Media has no _id. Cannot resolve media."
-            )
-
-            return None
-
-        media_dir = (
-            CACHE_ROOT
-            / media_id.replace(":", "_")
-        )
-
-        chunks_dir = media_dir / "chunks"
-
-        ext = self._infer_extension(
-            clip_ref
-        )
-
-        final_path = (
-            media_dir
-            / f"final{ext}"
-        )
-
-        media_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        chunks_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        if final_path.exists():
-
-            return {
-                "filepath": str(final_path),
                 "media_type": media_type,
                 "resolved": True,
             }
 
-        self.log.info(
-            "Media not cached. Fetching..."
+        if media_type not in {"video", "audio", "image"}:
+            self.log.error(f"Unsupported media type: {media_type}")
+            return None
+
+        if not media_id:
+            self.log.error("Media has no _id. Cannot resolve media.")
+            return None
+
+        resolved_path = self.resolver.resolve(
+            kind=media_type,
+            asset_id=media_id,
+            filename=clip_ref.get("title") or self._infer_extension(clip_ref),
+            mime=clip_ref.get("mime"),
         )
+        if resolved_path:
+            return {
+                "filepath": str(resolved_path),
+                "media_type": media_type,
+                "resolved": True,
+                "clip_ref": {**clip_ref, "type": media_type},
+            }
 
-        index = 0
-        total_chunks = None
-
-        while True:
-
-            part_path = (
-                chunks_dir
-                / f"{index:05d}.part"
-            )
-
-            if part_path.exists():
-
-                index += 1
-
-                continue
-
-            try:
-
-                response = (
-                    self._fetch_chunk_from_server(
-                        media_id,
-                        index,
-                    )
-                )
-
-            except Exception as e:
-
-                self.log.error(
-                    f"Failed fetching media "
-                    f"'{media_id}' chunk "
-                    f"{index}: {e}"
-                )
-
-                return None
-
-            if not response.get("ok"):
-
-                self.log.error(
-                    f"Failed to fetch chunk "
-                    f"{index}: "
-                    f"{response.get('error')}"
-                )
-
-                return None
-
-            data = response.get(
-                "data"
-            ) or {}
-
-            chunk = data.get("chunk")
-
-            if not chunk:
-
-                self.log.error(
-                    f"Chunk {index} for media "
-                    f"'{media_id}' contained "
-                    f"no data."
-                )
-
-                return None
-
-            part_path.write_bytes(
-                base64.b64decode(chunk)
-            )
-
-            total_chunks = data.get(
-                "total_chunks"
-            )
-
-            index += 1
-
-            if (
-                total_chunks is not None
-                and index >= total_chunks
-            ):
-                break
-
-        with open(
-            final_path,
-            "wb",
-        ) as outfile:
-
-            for part in sorted(
-                chunks_dir.iterdir()
-            ):
-
-                if not part.is_file():
-                    continue
-
-                if not part.name.endswith(
-                    ".part"
-                ):
-                    continue
-
-                outfile.write(
-                    part.read_bytes()
-                )
-
-        self.log.info(
-            f"Media assembled: {final_path}"
+        self.log.warning(
+            f"Asset '{media_id}' could not be resolved. Using placeholder."
         )
-
         return {
-            "filepath": str(final_path),
+            "filepath": self._resolve_placeholder(
+                {**clip_ref, "preferred_type": media_type}
+            ),
             "media_type": media_type,
-            "resolved": True,
+            "resolved": False,
         }
 
     # =========================================================================
@@ -3782,10 +3188,19 @@ class VSEBuilder(Vse_renderer):
 
     def build(self):
 
-        seq = self.instruction.get(
+        raw_sequence = self.instruction.get(
             "sequence",
             self.instruction,
         )
+
+        seq = _sanitize_bpy_value(raw_sequence)
+        if not isinstance(seq, dict):
+            raise TimelineResolutionError(
+                "Instruction sequence must be a plain Python dict after "
+                f"sanitization, got {type(seq).__name__}."
+            )
+
+        self.sequence = seq
 
         fps = seq.get(
             "fps",
@@ -3836,7 +3251,7 @@ class VSEBuilder(Vse_renderer):
         self.resolving_media = False
 
         self.channel_allocator = (
-            ChannelAllocator()
+            ChannelAllocator(max_channel=MAX_PERMANENT_CHANNEL)
         )
 
         self.timeline_resolver = (
@@ -3855,10 +3270,20 @@ class VSEBuilder(Vse_renderer):
 
         self._clear_sequencer()
 
-        tracks = seq.get(
+        raw_tracks = seq.get(
             "tracks",
             [],
         )
+        tracks = []
+        for track_index, raw_track in enumerate(raw_tracks):
+            track = _sanitize_bpy_value(raw_track)
+            if not isinstance(track, dict):
+                raise TimelineResolutionError(
+                    f"Track at index {track_index} is not a plain dict "
+                    f"after sanitization: {track!r}"
+                )
+            tracks.append(track)
+        seq["tracks"] = tracks
 
         # ---------------------------------------------------------------------
         # INDEX ALL CLIPS
@@ -3879,12 +3304,20 @@ class VSEBuilder(Vse_renderer):
 
             track["_id"] = track_id
 
-            for clip_index, clip in enumerate(
-                track.get(
-                    "clips",
-                    [],
-                )
-            ):
+            raw_clips = track.get("clips", [])
+            clips = []
+            for clip_index, raw_clip in enumerate(raw_clips):
+                clip = _sanitize_bpy_value(raw_clip)
+                if not isinstance(clip, dict):
+                    raise TimelineResolutionError(
+                        f"Clip at track '{track_id}', index {clip_index} "
+                        "is not a plain dict after sanitization: "
+                        f"{clip!r}"
+                    )
+                clips.append(clip)
+            track["clips"] = clips
+
+            for clip_index, clip in enumerate(clips):
 
                 clip_id = clip.get(
                     "_id"
@@ -4516,267 +3949,6 @@ class VSEBuilder(Vse_renderer):
 
         self.log.info(
             "Sequencer cleared"
-        )
-
-    # =========================================================================
-    # SERVER HELPERS
-    # =========================================================================
-
-    def iso_now(
-        self,
-    ):
-
-        return (
-            datetime.now(
-                timezone.utc
-            )
-            .isoformat(
-                timespec="milliseconds"
-            )
-            .replace(
-                "+00:00",
-                "Z",
-            )
-        )
-
-    def _post_json(
-        self,
-        url,
-        payload,
-    ):
-
-        self.log.info(
-            f"POST {url}"
-        )
-
-        try:
-
-            req = urllib.request.Request(
-                url=url,
-                data=json.dumps(
-                    payload
-                ).encode("utf-8"),
-                headers={
-                    "Content-Type":
-                        "application/json"
-                },
-                method="POST",
-            )
-
-            with urllib.request.urlopen(
-                req,
-                timeout=30,
-            ) as res:
-
-                return json.loads(
-                    res.read().decode(
-                        "utf-8"
-                    )
-                )
-
-        except Exception as e:
-
-            self.log.error(
-                f"POST FAILED {url}: {e}"
-            )
-
-            return {
-                "ok": False,
-                "error": str(e),
-            }
-
-    def update_server_status(
-        self,
-        status,
-    ):
-
-        if not self.generation:
-
-            self.log.warning(
-                f"update_server_status skipped "
-                f"({status}): no generation"
-            )
-
-            return
-
-        if not hasattr(
-            self,
-            "machine_id",
-        ):
-
-            self.machine_id = "unknown"
-
-        generation_id = (
-            self.generation.get(
-                "_id"
-            )
-        )
-
-        payload = {
-            "_id": generation_id,
-            "status": status,
-            "time": self.iso_now(),
-            "machine": self.machine_id,
-        }
-
-        return self._post_json(
-            f"{self.server_url}/update_generation_status",
-            payload,
-        )
-
-    # =========================================================================
-    # RENDER UPLOAD
-    # =========================================================================
-
-    def upload_rendered_media(
-        self,
-        chunk_size=2 * 1024 * 1024,
-    ):
-
-        scene = bpy.context.scene
-
-        title = self.instruction.get(
-            "name",
-            "<unk>",
-        )
-
-        description = self.instruction.get(
-            "description",
-            "",
-        )
-
-        user = self.instruction.get(
-            "editor",
-            "<unk>",
-        )
-
-        filepath = Path(
-            scene.render.filepath
-        )
-
-        if not filepath.exists():
-
-            self.log.error(
-                f"Render file does not exist: "
-                f"{filepath}"
-            )
-
-            return None
-
-        total_size = filepath.stat().st_size
-
-        if total_size <= 0:
-
-            self.log.error(
-                "Render file is empty"
-            )
-
-            return None
-
-        total_chunks = math.ceil(
-            total_size
-            / chunk_size
-        )
-
-        media_id = str(
-            uuid.uuid4()
-        )
-
-        with open(
-            filepath,
-            "rb",
-        ) as f:
-
-            for index in range(
-                total_chunks
-            ):
-
-                chunk_bytes = f.read(
-                    chunk_size
-                )
-
-                encoded = (
-                    base64.b64encode(
-                        chunk_bytes
-                    ).decode(
-                        "utf-8"
-                    )
-                )
-
-                response = (
-                    self._post_json(
-                        f"{self.editor_url}/upload_media",
-                        {
-                            "media_id":
-                                media_id,
-                            "chunk":
-                                encoded,
-                            "index":
-                                index,
-                            "size":
-                                len(
-                                    chunk_bytes
-                                ),
-                            "total_chunks":
-                                total_chunks,
-                        },
-                    )
-                )
-
-                if not response.get(
-                    "ok",
-                    False,
-                ):
-
-                    self.log.error(
-                        f"Failed uploading "
-                        f"render chunk {index}"
-                    )
-
-                    return None
-
-        response = self._post_json(
-            f"{self.editor_url}/add_media",
-            {
-                "_id": media_id,
-                "title": title,
-                "description": description,
-                "user": user,
-                "mime": "video/mp4",
-                "type": "video",
-                "total_size": total_size,
-            },
-        )
-
-        if not response.get(
-            "ok"
-        ):
-
-            self.log.error(
-                "Failed to add media metadata"
-            )
-
-            return None
-
-        return response["data"]
-
-    # =========================================================================
-    # GENERATION COMPLETE
-    # =========================================================================
-
-    def generation_complete(
-        self,
-        media_id,
-    ):
-
-        return self._post_json(
-            f"{self.server_url}/generation_complete",
-            {
-                "_id": self.generation.get(
-                    "_id"
-                ),
-                "editor_media": media_id,
-            },
         )
 
     # =========================================================================

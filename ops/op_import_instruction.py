@@ -1,6 +1,6 @@
 import bpy
 import json
-from bpy.types import Panel, Operator
+from pathlib import Path
 
 # -------------------------------
 # Operator to Load JSON Instruction
@@ -19,11 +19,12 @@ class IMPORT_INSTRUCTION_OT_Operator(bpy.types.Operator):
             return {'CANCELLED'}
 
         try:
-            with open(file_path, "r") as f:
-                instruction = json.load(f)  # parse JSON into a dict
+            path = Path(bpy.path.abspath(file_path))
+            with open(path, "r", encoding="utf-8") as instruction_file:
+                instruction = json.load(instruction_file)
 
             # Store it somewhere safe for other operators
-            bpy.app.driver_namespace["vse_instruction"] = instruction
+            context.scene["vse_instruction"] = instruction
 
             print("=== Instruction Loaded ===")
             print(instruction)  # logs parsed JSON to Blender console

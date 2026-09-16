@@ -7,10 +7,8 @@ from .vse_builder import VSEBuilder
 # ------------------------------
 # Constants & globals
 # ------------------------------
-MACHINE_ID = "savvy-m1-air-2020"
 IS_RENDERING = False
 HANDLERS_ATTACHED = False
-POLL_INTERVAL = 60  # seconds
 
 logger = Logger()
 
@@ -18,7 +16,7 @@ logger = Logger()
 # Render sequence logic
 # ------------------------------
 def render_sequence(builder):
-    generation_id = builder.generation.get('_id')
+    generation_id = (builder.generation or {}).get('_id')
     global HANDLERS_ATTACHED
 
     if HANDLERS_ATTACHED:
@@ -44,22 +42,20 @@ def render_sequence(builder):
         if on_complete in bpy.app.handlers.render_complete:
             bpy.app.handlers.render_complete.remove(on_complete)
 
-        # Upload rendered media
-        media = builder.upload_rendered_media()
-        if media:
-            builder.generation_complete(media.get('_id'))
-
-        builder.update_server_status("DONE")
+        builder.finish_render_and_report()
         props.connection_status = "Idle"
 
         IS_RENDERING = False
         HANDLERS_ATTACHED = False
 
-        # Resume polling
-        bpy.app.timers.register(
-            poll_backend_for_render,
-            first_interval=POLL_INTERVAL
-        )
+        # Resume only while polling remains enabled by the button.
+        if props.server_running and not bpy.app.timers.is_registered(
+            poll_backend_for_render
+        ):
+            bpy.app.timers.register(
+                poll_backend_for_render,
+                first_interval=props.poll_interval,
+            )
 
     bpy.app.handlers.render_pre.append(on_start)
     bpy.app.handlers.render_complete.append(on_complete)
@@ -73,9 +69,16 @@ def start_render_job(generation):
     global IS_RENDERING
 
     IS_RENDERING = True
-    builder = VSEBuilder(generation.get('config'))
+    instruction = dict(generation.get('config') or {})
+    instruction.setdefault("generation", {
+        "_id": generation.get("_id"),
+        **(generation.get("generation") or {}),
+    })
+    if generation.get("callback"):
+        instruction["callback"] = generation["callback"]
+    builder = VSEBuilder(instruction)
 
-    builder.machine_id = MACHINE_ID
+    builder.machine_id = bpy.context.scene.vse_instructor_server_props.machine_id
 
     builder.set_generation(generation)
 
@@ -99,18 +102,26 @@ def poll_backend_for_render():
     scene = bpy.context.scene
     props = scene.vse_instructor_server_props
 
+    if not props.server_running:
+        return None
+
     logger.info("Polling backend...")
     if IS_RENDERING:
         props.connection_status = "Busy"
-        return POLL_INTERVAL
+        return props.poll_interval
 
     props.connection_status = "Polling"
     update_ui()
     try:
-        payload = json.dumps({"machine": MACHINE_ID}).encode("utf-8")
+        if not props.server_url:
+            logger.error("Cannot poll: server URL is not configured")
+            props.connection_status = "Offline"
+            return props.poll_interval
+
+        payload = json.dumps({"machine": props.machine_id}).encode("utf-8")
         logger.info("Sending probe for generation request")
         req = urllib.request.Request(
-            url=f"{VSEBuilder.server_url}/probe_new_generation",
+            url=f"{props.server_url.rstrip('/')}/probe_new_generation",
             data=payload,
             headers={"Content-Type": "application/json"},
             method="POST"
@@ -126,14 +137,14 @@ def poll_backend_for_render():
         if not response.get("ok"):
             props.connection_status = "Idle"
             update_ui()
-            return POLL_INTERVAL
+            return props.poll_interval
 
         # Job found
         generation = response.get("data")
         if not generation:
             props.connection_status = "Idle"
             update_ui()
-            return POLL_INTERVAL
+            return props.poll_interval
 
         # Start render
         props.connection_status = "Busy"
@@ -142,8 +153,8 @@ def poll_backend_for_render():
         return None  # stop timer until render completes
 
     except Exception as e:
-        logger.error("Polling error:", e)
+        logger.error(f"Polling error: {e}")
         props.connection_status = "Error"
         update_ui()
-        return POLL_INTERVAL
+        return props.poll_interval
 

@@ -348,6 +348,20 @@ class TimelineResolver:
         if value is None:
             return 0
 
+        type_name = type(value).__name__
+        if (
+            "bpy" in type_name.lower()
+            or "idprop" in type_name.lower()
+            or "property" in type_name.lower()
+        ):
+            raise TimelineResolutionError(
+                "Invalid timing value (Blender property leaked into data) "
+                f"for clip={clip_id!r}: {value!r}. "
+                "This usually means clip['start'] / clip['duration'] "
+                "was assigned a scene custom property instead of a number "
+                "or a timing dict {'type': ..., 'value': ...}."
+            )
+
         if isinstance(
             value,
             (int, float)
@@ -361,13 +375,15 @@ class TimelineResolver:
         ):
 
             raise TimelineResolutionError(
-                f"Invalid timing value: {value!r}"
+                f"Invalid timing value for clip={clip_id!r}: {value!r} "
+                f"(type={type(value).__name__}). Expected int/float or "
+                "a dict with a 'type' key."
             )
 
         if "type" not in value:
 
             raise TimelineResolutionError(
-                f"Timing value has no type: {value!r}"
+                f"Timing value has no type for clip={clip_id!r}: {value!r}"
             )
 
         timing_type = value["type"]
@@ -1387,7 +1403,8 @@ class TimelineResolver:
 
                 duration = (
                     self._resolve_absolute_timing_only(
-                        duration_value
+                        duration_value,
+                        clip_id=clip_obj._id
                     )
                 )
 
@@ -1426,7 +1443,8 @@ class TimelineResolver:
 
                 start = (
                     self._resolve_absolute_timing_only(
-                        start_value
+                        start_value,
+                        clip_id=clip_obj._id
                     )
                 )
 
@@ -1448,8 +1466,23 @@ class TimelineResolver:
 
     def _resolve_absolute_timing_only(
         self,
-        value
+        value,
+        clip_id=None
     ):
+
+        type_name = type(value).__name__
+        if (
+            "bpy" in type_name.lower()
+            or "idprop" in type_name.lower()
+            or "property" in type_name.lower()
+        ):
+            raise TimelineResolutionError(
+                "Invalid timing value (Blender property leaked into data) "
+                f"for clip={clip_id!r}: {value!r}. "
+                "This usually means clip['start'] / clip['duration'] "
+                "was assigned a scene custom property instead of a number "
+                "or a timing dict {'type': ..., 'value': ...}."
+            )
 
         if isinstance(
             value,
@@ -1464,7 +1497,7 @@ class TimelineResolver:
         ):
 
             raise TimelineResolutionError(
-                f"Invalid timing value: {value!r}"
+                f"Invalid timing value for clip={clip_id!r}: {value!r}"
             )
 
         timing_type = value.get(
@@ -2215,10 +2248,15 @@ class TimelineResolver:
                 )
             )
 
-            resolved_start = self.resolve_ms(
-                start_value,
-                clip_id=clip_id
-            )
+            try:
+                resolved_start = self.resolve_ms(
+                    start_value,
+                    clip_id=clip_id
+                )
+            except TimelineResolutionError as exc:
+                raise TimelineResolutionError(
+                    f"While resolving start of clip '{clip_id}': {exc}"
+                ) from exc
 
             #
             # Duration.
@@ -2233,10 +2271,15 @@ class TimelineResolver:
                     clip_id
                 )
 
-            duration = self.resolve_ms(
-                duration_value,
-                clip_id=clip_id
-            )
+            try:
+                duration = self.resolve_ms(
+                    duration_value,
+                    clip_id=clip_id
+                )
+            except TimelineResolutionError as exc:
+                raise TimelineResolutionError(
+                    f"While resolving duration of clip '{clip_id}': {exc}"
+                ) from exc
 
             if duration < 0:
 
