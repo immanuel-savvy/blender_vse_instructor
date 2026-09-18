@@ -33,4 +33,5 @@ class VSE_INSTRUCTOR_PT_MainPanel(Panel):
                 row.operator("vse_instructor.apply_instruction", text="Apply")
                 row.operator("vse_instructor.render_sequence", text="Render")
                 box.operator("vse_instructor.upload_render", text="Upload last render")
+                box.operator("sequencer.export_json", text="Export JSON", icon="EXPORT")
       

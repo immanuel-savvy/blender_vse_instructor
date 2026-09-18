@@ -493,6 +493,25 @@ class VSEBuilder(CallbackClient, Vse_renderer):
 
         return f"FX{self._effect_counter:03d}"
 
+    def _strip_name_for_clip(self, clip, fallback_prefix="CLIP"):
+        """Prefer the editorial clip ID for stable, traceable strip names."""
+        clip_id = (clip or {}).get("_id")
+        if clip_id:
+            return str(clip_id)
+
+        if fallback_prefix == "V":
+            return self._next_video_name()
+        if fallback_prefix == "A":
+            return self._next_audio_name()
+        if fallback_prefix == "IMG":
+            return self._next_image_name()
+        if fallback_prefix == "TXT":
+            return self._next_text_name()
+        if fallback_prefix == "FX":
+            return self._next_effect_name()
+
+        return f"{fallback_prefix}_{uuid.uuid4()}"
+
     def _next_probe_name(self):
 
         self._probe_counter += 1
@@ -1806,8 +1825,9 @@ class VSEBuilder(CallbackClient, Vse_renderer):
                     "available for video clip."
                 )
 
-            video_name = (
-                self._next_video_name()
+            video_name = self._strip_name_for_clip(
+                clip,
+                fallback_prefix="V",
             )
 
             video = (
@@ -1851,8 +1871,9 @@ class VSEBuilder(CallbackClient, Vse_renderer):
 
             if audio_channel is not None:
 
-                audio_name = (
-                    self._next_audio_name()
+                audio_name = self._strip_name_for_clip(
+                    clip,
+                    fallback_prefix="A",
                 )
 
                 audio = (
@@ -1951,8 +1972,9 @@ class VSEBuilder(CallbackClient, Vse_renderer):
                     "No audio channel available."
                 )
 
-            name = (
-                self._next_audio_name()
+            name = self._strip_name_for_clip(
+                clip,
+                fallback_prefix="A",
             )
 
             audio = (
@@ -2054,8 +2076,9 @@ class VSEBuilder(CallbackClient, Vse_renderer):
                     "available for image."
                 )
 
-            name = (
-                self._next_image_name()
+            name = self._strip_name_for_clip(
+                clip,
+                fallback_prefix="IMG",
             )
 
             image_strip = (
@@ -3202,6 +3225,9 @@ class VSEBuilder(CallbackClient, Vse_renderer):
 
         self.sequence = seq
 
+        timeline_id = seq.get("_id") or self.instruction.get("timeline_id")
+        bpy.context.scene["timeline_id"] = timeline_id or "unknown_timeline"
+
         fps = seq.get(
             "fps",
             24,
@@ -3537,6 +3563,13 @@ class VSEBuilder(CallbackClient, Vse_renderer):
             f"{len(self.strips)} strips materialized."
         )
 
+        from ..ops.op_export_json import export_sequencer_to_json
+
+        export_path = export_sequencer_to_json(
+            bpy.context.scene["timeline_id"],
+        )
+        self.log.info(f"Sequencer JSON exported: {export_path}")
+
     # =========================================================================
     # MATERIALIZE RESOLVED CLIP
     # =========================================================================
@@ -3799,8 +3832,9 @@ class VSEBuilder(CallbackClient, Vse_renderer):
 
             return None
 
-        name = (
-            self._next_text_name()
+        name = self._strip_name_for_clip(
+            clip,
+            fallback_prefix="TXT",
         )
 
         txt = (
