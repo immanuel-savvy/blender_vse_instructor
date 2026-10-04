@@ -4023,3 +4023,4 @@ class VSEBuilder(CallbackClient, Vse_renderer):
         return str(
             blend_path
         )
+    

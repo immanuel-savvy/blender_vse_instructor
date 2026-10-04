@@ -284,7 +284,7 @@ class Vse_renderer:
         from pathlib import Path
         output_dir = Path.home() / "VSE_Instructor_Renders"
         output_dir.mkdir(parents=True, exist_ok=True)
-        scene.render.filepath = str(output_dir / f"{self.instruction.get('_id', 'output')}.mp4")
+        scene.render.filepath = str(output_dir / f"{self.instruction.get('name', self.instruction.get('_id', 'output'))}.mp4")
 
         scene.render.use_sequencer = True
 
