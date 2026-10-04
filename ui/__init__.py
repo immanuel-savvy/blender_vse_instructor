@@ -4,6 +4,13 @@ from .panel_server import VSE_INSTRUCTOR_PT_ServerPanel, VSEInstructorServerProp
 from .panel_logs import VSE_INSTRUCTOR_PT_Logs, VSE_INSTRUCTOR_UL_Logs
 from .panel_stream import VIEW3D_PT_vse_instructor_stream
 
+
+def _camera_stream_enabled_update(self, context):
+    from ..core.stream_capture import ensure_stream_timer
+
+    ensure_stream_timer()
+
+
 classes = [
     VSEServerLogLine,
     VSE_INSTRUCTOR_UL_Logs,
@@ -56,24 +63,20 @@ def register():
             max=65535,
             description="Port of the mediasoup server",
         )
-    if not hasattr(bpy.types.Scene, "vse_instructor_stream_status"):
-        bpy.types.Scene.vse_instructor_stream_status = bpy.props.StringProperty(
-            name="Stream Status",
-            default="idle",
-        )
-    if not hasattr(bpy.types.Scene, "vse_instructor_stream_error"):
-        bpy.types.Scene.vse_instructor_stream_error = bpy.props.StringProperty(
-            name="Stream Error",
-            default="",
-        )
-    if not hasattr(bpy.types.Scene, "vse_instructor_stream_frames"):
-        bpy.types.Scene.vse_instructor_stream_frames = bpy.props.IntProperty(
-            name="Stream Frames",
-            default=0,
+    if not hasattr(bpy.types.Object, "vse_instructor_stream_enabled"):
+        bpy.types.Object.vse_instructor_stream_enabled = bpy.props.BoolProperty(
+            name="Stream Camera",
+            description="Stream this camera while the timeline is playing",
+            default=False,
+            update=_camera_stream_enabled_update,
         )
 
 
 def unregister():
+    from ..core.stream_capture import stop_stream
+
+    stop_stream(clear_selection=True)
+
     # Remove pointer properties first
     if hasattr(bpy.types.Scene, "vse_instructor_props"):
         del bpy.types.Scene.vse_instructor_props
@@ -83,12 +86,8 @@ def unregister():
         del bpy.types.Scene.vse_instructor_stream_host
     if hasattr(bpy.types.Scene, "vse_instructor_stream_port"):
         del bpy.types.Scene.vse_instructor_stream_port
-    if hasattr(bpy.types.Scene, "vse_instructor_stream_status"):
-        del bpy.types.Scene.vse_instructor_stream_status
-    if hasattr(bpy.types.Scene, "vse_instructor_stream_error"):
-        del bpy.types.Scene.vse_instructor_stream_error
-    if hasattr(bpy.types.Scene, "vse_instructor_stream_frames"):
-        del bpy.types.Scene.vse_instructor_stream_frames
+    if hasattr(bpy.types.Object, "vse_instructor_stream_enabled"):
+        del bpy.types.Object.vse_instructor_stream_enabled
 
     # Unregister classes in reverse order
     for cls in reversed(classes):

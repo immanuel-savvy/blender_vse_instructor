@@ -4,7 +4,7 @@ from .op_apply_instruction import APPLY_INSTRUCTION_OT_Operator
 from .op_render_sequence import RENDER_SEQUENCE_OT_Operator, VSE_INSTRUCTOR_OT_UploadRender
 from .op_start_server import VSE_INSTRUCTOR_OT_ServerToggle
 from .op_export_json import SEQUENCER_OT_export_json
-from .op_stream import VSE_INSTRUCTOR_OT_StreamStart, VSE_INSTRUCTOR_OT_StreamStop
+from .op_stream import VSE_INSTRUCTOR_OT_StreamStop
 
 classes = [
     IMPORT_INSTRUCTION_OT_Operator,
@@ -13,7 +13,6 @@ classes = [
     VSE_INSTRUCTOR_OT_UploadRender,
     VSE_INSTRUCTOR_OT_ServerToggle,
     SEQUENCER_OT_export_json,
-    VSE_INSTRUCTOR_OT_StreamStart,
     VSE_INSTRUCTOR_OT_StreamStop,
 ]
 
