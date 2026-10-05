@@ -9,7 +9,11 @@ class VIEW3D_PT_vse_instructor_stream(bpy.types.Panel):
     bl_category = "VSE Instructor"
 
     def draw(self, context):
-        from ..core.stream_capture import _get_state, ensure_stream_timer
+        from ..core.stream_capture import (
+            STREAM_DEBUG,
+            _get_state,
+            ensure_stream_timer,
+        )
 
         layout = self.layout
         scene = context.scene
@@ -44,6 +48,23 @@ class VIEW3D_PT_vse_instructor_stream(bpy.types.Panel):
                     "vse_instructor_stream_enabled",
                     text=camera.name,
                 )
+                settings_row = layout.row(align=True)
+                settings_row.prop(
+                    camera,
+                    "vse_instructor_stream_resolution",
+                    text="Resolution",
+                )
+                settings_row.prop(
+                    camera,
+                    "vse_instructor_stream_fps",
+                    text="FPS",
+                )
+                encoder_row = layout.row(align=True)
+                encoder_row.prop(
+                    camera,
+                    "vse_instructor_stream_encoder",
+                    text="Encoder",
+                )
                 if stream is None:
                     row.label(text="Idle", icon="PAUSE")
                 elif stream["status"] == "error":
@@ -56,7 +77,24 @@ class VIEW3D_PT_vse_instructor_stream(bpy.types.Panel):
                 elif stream["status"] == "starting":
                     row.label(text="Starting", icon="TIME")
                 else:
-                    row.label(text=f"{stream['frame_count']} frames", icon="PLAY")
+                    row.label(
+                        text=f"{stream['encoder']}: {stream['frame_count']} frames",
+                        icon="PLAY",
+                    )
+                    if STREAM_DEBUG:
+                        metrics = stream["metrics"]
+                        with stream["metrics_lock"]:
+                            capture_time_ms = metrics["capture_time_ms"]
+                            writer_time_ms = metrics["ffmpeg_write_time_ms"]
+                        layout.label(
+                            text=(
+                                f"{stream['capture_method']} | "
+                                f"capture {capture_time_ms:.1f} ms | "
+                                f"FFmpeg write {writer_time_ms:.1f} ms | "
+                                f"{stream['dropped_frames']} dropped"
+                            ),
+                            icon="TIME",
+                        )
 
         active_count = sum(
             stream["status"] == "streaming"
